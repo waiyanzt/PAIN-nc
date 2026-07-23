@@ -28,9 +28,9 @@ processing all paths at once.
 
 ## Setup
 
-Python 3.10+ and a CUDA build of PyTorch are recommended on the HPC system.
-Install PyTorch using the command appropriate for the cluster's CUDA version,
-then install the remaining requirements:
+The default HPC target is an NVIDIA V100 (Volta, compute capability 7.0).
+`requirements.txt` therefore pins the CUDA 12.6 build of PyTorch 2.13, which
+contains V100 kernels. CUDA 13 PyTorch wheels do not support Volta.
 
 ```bash
 python -m venv .venv
@@ -40,6 +40,15 @@ pip install -r requirements.txt
 ```
 
 No PyTorch Geometric dependency is required.
+
+Verify the environment on an allocated GPU before preprocessing or training:
+
+```bash
+python -c "import torch; print(torch.__version__); print(torch.cuda.get_device_name(0)); print(torch.cuda.get_device_capability(0)); print(torch.cuda.get_arch_list()); print(torch.ones(1, device='cuda'))"
+```
+
+On a V100, the version should end in `+cu126`, the device capability should be
+`(7, 0)`, and the architecture list should contain `sm_70`.
 
 ## IMDb preprocessing
 
