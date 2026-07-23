@@ -1,0 +1,43 @@
+# Faithful PAIN architecture from the official ZINC experiment, adapted only
+# at the output: graph pooling is replaced by node-wise classification.
+device: cuda:0
+
+data:
+  preprocessed_dir: data/preprocessed/IMDB
+  shared_path: data/preprocessed/IMDB/shared.pt
+
+model:
+  hidden_dim: 128
+  num_layers: 5
+  lstm_depth: 2
+  head_layers: 2
+  path_length: 3
+  dropout: 0.0
+  share_lstm: true
+  reverse_paths: true
+  mark_neighbors: true
+  shortest_path_encoding: false
+  path_aggregation: sum
+  jumping_knowledge: last
+  use_node_types: true
+
+  # Chunking is exact: every path still contributes to the same sum.
+  path_chunk_size: 100000
+  checkpoint_chunks: true
+
+  # true is faster if the GPU can retain the complete path artifact.
+  # Set false to stream chunks from host memory.
+  paths_on_device: true
+
+training:
+  epochs: 1000
+  learning_rate: 0.001
+  weight_decay: 0.0
+  lr_factor: 0.5
+  lr_patience: 20
+  min_learning_rate: 0.00001
+  early_stopping_patience: 80
+  gradient_clip_norm: 5.0
+  max_hours: 12
+  deterministic: true
+
