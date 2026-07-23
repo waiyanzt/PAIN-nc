@@ -117,21 +117,47 @@ class PathAggregator(nn.Module):
             lengths = graph.path_lengths[start:stop]
             roots = graph.mask_index[start:stop].to(x.device, non_blocking=True)
 
-            def encode(features: torch.Tensor) -> torch.Tensor:
+            def encode(
+                features: torch.Tensor,
+                chunk_path_index: torch.Tensor,
+                chunk_lengths: torch.Tensor,
+                chunk_path_edge_idx: torch.Tensor,
+                chunk_neighbor_mask: torch.Tensor,
+                chunk_distances: torch.Tensor,
+            ) -> torch.Tensor:
                 return self._encode_chunk(
                     features,
                     edge_type,
+                    chunk_path_index,
+                    chunk_lengths,
+                    chunk_path_edge_idx,
+                    chunk_neighbor_mask,
+                    chunk_distances,
+                )
+
+            if self.training and self.checkpoint_chunks:
+                # Pass every chunk-local tensor explicitly. Capturing these
+                # values in the loop closure makes backward recomputation use
+                # the final chunk for earlier checkpoint frames.
+                messages = checkpoint(
+                    encode,
+                    x,
+                    path_index,
+                    lengths,
+                    path_edge_idx,
+                    neighbor_mask,
+                    distances,
+                    use_reentrant=False,
+                )
+            else:
+                messages = encode(
+                    x,
                     path_index,
                     lengths,
                     path_edge_idx,
                     neighbor_mask,
                     distances,
                 )
-
-            if self.training and self.checkpoint_chunks:
-                messages = checkpoint(encode, x, use_reentrant=False)
-            else:
-                messages = encode(x)
             aggregate = aggregate.index_add(0, roots, messages)
             if counts is not None:
                 counts = counts.index_add(
@@ -246,4 +272,3 @@ class PainNodeClassifier(nn.Module):
 
     def forward(self, graph: PainGraph) -> torch.Tensor:
         return self.classifier(self.node_embeddings(graph))
-
