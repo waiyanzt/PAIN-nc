@@ -1,0 +1,4 @@
+0	Database
+1	Data Mining
+2	AI
+3	Information Retrieval
