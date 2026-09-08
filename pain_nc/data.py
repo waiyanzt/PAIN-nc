@@ -136,6 +136,30 @@ def reverse_valid_paths(payload: dict) -> None:
     payload["meta"]["runtime_path_order"] = "leaf_first"
 
 
+def group_paths_by_root(payload: dict) -> None:
+    """Canonically group paths by root for deterministic segment reduction.
+
+    Early PAIN-NC preprocessing artifacts were emitted in decreasing path-length
+    order, so the same root appeared in several disjoint blocks.  The LSTM is
+    evaluated independently for every path and aggregation is a sum/mean, hence
+    reordering path columns does not change the represented graph.  A stable
+    root grouping also preserves the original decreasing-length order within
+    each root.
+    """
+    roots = payload["mask_index"]
+    if roots.numel() < 2 or not bool(torch.any(roots[1:] < roots[:-1])):
+        return
+
+    order = torch.argsort(roots, stable=True)
+    for name in ("path_index", "path_edge_idx"):
+        payload[name] = payload[name].index_select(1, order)
+    for name in ("path_lengths", "mask_index", "neighbor_mask", "distances"):
+        payload[name] = payload[name].index_select(0, order)
+
+    payload["meta"] = dict(payload.get("meta", {}))
+    payload["meta"]["runtime_path_grouping"] = "root_stable"
+
+
 def validate_graph(graph: PainGraph) -> None:
     n, p = graph.num_nodes, graph.num_paths
     if graph.y.shape != (n,) or graph.node_type.shape != (n,):
@@ -199,6 +223,7 @@ def load_imdb_graph(
         )
     if reverse_paths:
         reverse_valid_paths(variant)
+    group_paths_by_root(variant)
     graph = PainGraph(
         x=shared["x"],
         y=shared["y"],
