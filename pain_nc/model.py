@@ -27,6 +27,7 @@ class PathAggregator(nn.Module):
         mark_neighbors: bool,
         shortest_path_encoding: bool,
         aggregation: Literal["sum", "mean"],
+        dropout: float,
         chunk_size: int,
         checkpoint_chunks: bool,
         lstm: nn.LSTM | None = None,
@@ -37,19 +38,20 @@ class PathAggregator(nn.Module):
         self.mark_neighbors = mark_neighbors
         self.shortest_path_encoding = shortest_path_encoding
         self.aggregation = aggregation
+        self.dropout = dropout
         self.chunk_size = chunk_size
         self.checkpoint_chunks = checkpoint_chunks
-        self.edge_dummy = num_edge_types
-        self.edge_embedding = nn.Embedding(
-            num_edge_types + 1, hidden_dim, padding_idx=self.edge_dummy
-        )
+        self.edge_embedding = nn.Embedding(num_edge_types, hidden_dim)
+        nn.init.xavier_uniform_(self.edge_embedding.weight)
         if shortest_path_encoding:
-            self.distance_embedding = nn.Embedding(path_length + 1, hidden_dim)
+            # The reference reserves one additional distance/padding slot.
+            self.distance_embedding = nn.Embedding(path_length + 2, hidden_dim)
         else:
             self.position_embedding = nn.Parameter(
-                torch.empty(path_length + 1, hidden_dim)
+                torch.empty(path_length + 1, 1, hidden_dim)
             )
-            nn.init.xavier_uniform_(self.position_embedding)
+            # Match the authors' PathGNN positional encoding initialization.
+            nn.init.xavier_normal_(self.position_embedding)
 
         input_dim = hidden_dim * 3 + int(mark_neighbors)
         self.lstm = lstm or nn.LSTM(
@@ -59,6 +61,29 @@ class PathAggregator(nn.Module):
     def _device_chunk(self, tensor: torch.Tensor, start: int, stop: int, device: torch.device) -> torch.Tensor:
         chunk = tensor[..., start:stop]
         return chunk.to(device, non_blocking=True)
+
+    @staticmethod
+    def _deterministic_segment_add(
+        aggregate: torch.Tensor,
+        roots: torch.Tensor,
+        messages: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Add root-sorted messages without CUDA atomic scatter operations."""
+        if roots.numel() == 0:
+            return aggregate, roots.new_zeros((0, 1), dtype=messages.dtype)
+        unique_roots, lengths = torch.unique_consecutive(
+            roots, return_counts=True
+        )
+        ends = torch.cumsum(lengths, dim=0)
+        prefix = torch.cat(
+            (messages.new_zeros((1, messages.shape[1])), messages.cumsum(dim=0)),
+            dim=0,
+        )
+        segment_sums = prefix[ends] - prefix[ends - lengths]
+        updated = aggregate.index_copy(
+            0, unique_roots, aggregate[unique_roots] + segment_sums
+        )
+        return updated, lengths.to(messages.dtype).unsqueeze(1)
 
     def _encode_chunk(
         self,
@@ -74,17 +99,16 @@ class PathAggregator(nn.Module):
         node_features = x[safe_nodes]
 
         safe_edges = path_edge_idx.clamp(min=0)
-        edge_ids = torch.full_like(safe_edges, self.edge_dummy)
         valid_edges = path_edge_idx >= 0
-        edge_ids[valid_edges] = edge_type[safe_edges[valid_edges]]
-        edge_features = self.edge_embedding(edge_ids)
+        edge_features = self.edge_embedding(edge_type[safe_edges])
+        edge_features = edge_features * valid_edges.unsqueeze(-1)
 
         if self.shortest_path_encoding:
             position_features = self.distance_embedding(
-                distances.clamp(min=0, max=self.path_length).t()
+                distances.clamp(min=0, max=self.path_length + 1).t()
             )
         else:
-            position_features = self.position_embedding[:, None, :].expand(
+            position_features = self.position_embedding.expand(
                 -1, path_index.shape[1], -1
             )
 
@@ -93,6 +117,9 @@ class PathAggregator(nn.Module):
             neighbors = neighbor_mask.t().clamp(min=0).to(x.dtype).unsqueeze(-1)
             pieces.append(neighbors)
         sequence = torch.cat(pieces, dim=-1)
+        # The reference PathConv applies dropout to the concatenated path
+        # representation before packing it for the LSTM.
+        sequence = F.dropout(sequence, p=self.dropout, training=self.training)
         packed = pack_padded_sequence(
             sequence,
             path_lengths.cpu(),
@@ -158,10 +185,15 @@ class PathAggregator(nn.Module):
                     neighbor_mask,
                     distances,
                 )
-            aggregate = aggregate.index_add(0, roots, messages)
+            aggregate, segment_counts = self._deterministic_segment_add(
+                aggregate, roots, messages
+            )
             if counts is not None:
-                counts = counts.index_add(
-                    0, roots, torch.ones((len(roots), 1), device=x.device, dtype=x.dtype)
+                unique_roots = torch.unique_consecutive(roots)
+                counts = counts.index_copy(
+                    0,
+                    unique_roots,
+                    counts[unique_roots] + segment_counts,
                 )
         if counts is not None:
             aggregate = aggregate / counts.clamp_min(1)
@@ -179,6 +211,8 @@ class PainLayer(nn.Module):
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
         )
 
     def forward(self, x: torch.Tensor, graph: PainGraph) -> torch.Tensor:
@@ -240,6 +274,7 @@ class PainNodeClassifier(nn.Module):
                 mark_neighbors=mark_neighbors,
                 shortest_path_encoding=shortest_path_encoding,
                 aggregation=path_aggregation,
+                dropout=dropout,
                 chunk_size=path_chunk_size,
                 checkpoint_chunks=checkpoint_chunks,
                 lstm=shared_lstm,
@@ -249,7 +284,14 @@ class PainNodeClassifier(nn.Module):
         representation_dim = hidden_dim * num_layers if jumping_knowledge == "concat" else hidden_dim
         head = []
         for _ in range(head_layers - 1):
-            head.extend((nn.Linear(representation_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout)))
+            # Match the reference final MLP order.
+            head.extend(
+                (
+                    nn.Linear(representation_dim, hidden_dim),
+                    nn.Dropout(dropout),
+                    nn.ReLU(),
+                )
+            )
             representation_dim = hidden_dim
         head.append(nn.Linear(representation_dim, num_classes))
         self.classifier = nn.Sequential(*head)

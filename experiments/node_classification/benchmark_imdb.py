@@ -13,6 +13,7 @@ import torch
 
 from pain_nc.config import load_config, merged_config
 from experiments.node_classification.train import save_artifact, train_one_run
+from pain_nc.telemetry import CUDA_MEMORY_KEYS, validate_resource_metrics
 
 
 DEFAULT_SEEDS = (1566911444, 20241017, 20251017)
@@ -25,6 +26,7 @@ VARIANTS = {
 }
 METRICS = (
     "best_val_accuracy",
+    "best_val_macro_f1",
     "test_accuracy",
     "test_precision_macro",
     "test_recall_macro",
@@ -32,6 +34,23 @@ METRICS = (
     "test_f1_macro",
     "elapsed_seconds",
     "time_to_best_seconds",
+)
+RESOURCE_METRICS = (
+    "parameter_bytes",
+    "buffer_bytes",
+    "static_model_bytes",
+    "checkpoint_bytes",
+    "process_peak_rss_bytes",
+    "training_gpu_allocated_bytes",
+    "training_gpu_reserved_bytes",
+    "training_gpu_peak_allocated_bytes",
+    "training_gpu_peak_reserved_bytes",
+    "inference_gpu_allocated_bytes",
+    "inference_gpu_reserved_bytes",
+    "inference_gpu_peak_allocated_bytes",
+    "inference_gpu_peak_reserved_bytes",
+    "shared_bytes",
+    "variant_bytes",
 )
 
 
@@ -64,6 +83,25 @@ def preflight(config: dict[str, Any], variants: list[str]) -> None:
 
 
 def scalar_row(artifact: dict[str, Any]) -> dict[str, Any]:
+    resources = artifact.get("resources", {})
+    validate_resource_metrics(resources)
+    resource_columns = {
+        key: int(resources[key])
+        for key in (
+            "parameter_bytes",
+            "buffer_bytes",
+            "static_model_bytes",
+            "checkpoint_bytes",
+            "process_peak_rss_bytes",
+        )
+    }
+    for phase in ("training_gpu", "inference_gpu"):
+        prefix = phase.removesuffix("_gpu")
+        for key in CUDA_MEMORY_KEYS:
+            resource_columns[f"{prefix}_{key}"] = int(resources[phase][key])
+    resource_columns.update(
+        {key: int(value) for key, value in resources["artifacts"].items()}
+    )
     return {
         "variant": artifact["variant"],
         "seed": artifact["seed"],
@@ -71,6 +109,7 @@ def scalar_row(artifact: dict[str, Any]) -> dict[str, Any]:
         "epochs_trained": artifact["epochs_trained"],
         "num_paths": artifact["num_paths"],
         **{metric: artifact[metric] for metric in METRICS},
+        **resource_columns,
     }
 
 
@@ -87,7 +126,7 @@ def summarize(rows: list[dict[str, Any]], variants: list[str]) -> list[dict[str,
     for variant in variants:
         selected = [row for row in rows if row["variant"] == variant]
         row: dict[str, Any] = {"variant": variant, "n_seeds": len(selected)}
-        for metric in METRICS:
+        for metric in (*METRICS, *RESOURCE_METRICS):
             values = np.asarray([item[metric] for item in selected], dtype=np.float64)
             row[f"{metric}_mean"] = float(values.mean())
             row[f"{metric}_std"] = float(values.std(ddof=1)) if len(values) > 1 else 0.0
@@ -122,6 +161,13 @@ def main() -> None:
             if destination.exists() and not args.overwrite:
                 print(f"Loading existing {destination}")
                 artifact = torch.load(destination, map_location="cpu", weights_only=False)
+                try:
+                    validate_resource_metrics(artifact.get("resources", {}))
+                except ValueError as error:
+                    raise RuntimeError(
+                        f"Existing artifact {destination} predates mandatory "
+                        "memory telemetry. Re-run with --overwrite."
+                    ) from error
             else:
                 print(f"\n=== {variant} | seed={seed} ===")
                 artifact = train_one_run(
