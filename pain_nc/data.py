@@ -16,6 +16,15 @@ PATH_FIELDS = (
     "distances",
 )
 
+SHARED_TENSOR_FIELDS = (
+    "x",
+    "y",
+    "node_type",
+    "train_mask",
+    "val_mask",
+    "test_mask",
+)
+
 
 @dataclass
 class PainGraph:
@@ -51,17 +60,27 @@ class PainGraph:
 
     @property
     def num_node_types(self) -> int:
-        return int(self.node_type.max().item() + 1)
+        names = self.shared_meta.get("node_type_names", ())
+        return len(names) if names else int(self.node_type.max().item() + 1)
 
     @property
     def num_edge_types(self) -> int:
-        return int(self.edge_type.max().item() + 1)
+        # Use the dataset-wide relation vocabulary rather than the maximum
+        # relation observed in this particular physical variant. This keeps
+        # independently trained and jointly augmented models shape-identical.
+        names = self.variant_meta.get("edge_type_names", ())
+        return len(names) if names else int(self.edge_type.max().item() + 1)
 
     @property
     def num_paths(self) -> int:
         return int(self.path_lengths.numel())
 
-    def to(self, device: torch.device | str, move_paths: bool = True) -> "PainGraph":
+    def to(
+        self,
+        device: torch.device | str,
+        move_paths: bool = True,
+        shared_from: "PainGraph | None" = None,
+    ) -> "PainGraph":
         """Move model inputs to a device.
 
         ``path_lengths`` intentionally remains on CPU because PyTorch's packed
@@ -73,7 +92,9 @@ class PainGraph:
         values = {}
         for item in fields(self):
             value = getattr(self, item.name)
-            if not isinstance(value, torch.Tensor):
+            if shared_from is not None and item.name in SHARED_TENSOR_FIELDS:
+                values[item.name] = getattr(shared_from, item.name)
+            elif not isinstance(value, torch.Tensor):
                 values[item.name] = value
             elif item.name == "path_lengths":
                 values[item.name] = value.cpu()
@@ -136,6 +157,12 @@ def validate_graph(graph: PainGraph) -> None:
         raise ValueError("path_lengths contains an invalid sequence length")
     if int(graph.mask_index.min()) < 0 or int(graph.mask_index.max()) >= n:
         raise ValueError("mask_index contains an invalid root node")
+    if graph.mask_index.numel() > 1 and torch.any(
+        graph.mask_index[1:] < graph.mask_index[:-1]
+    ):
+        raise ValueError(
+            "mask_index must be root-sorted for deterministic segment reduction"
+        )
     for name in ("train_mask", "val_mask", "test_mask"):
         mask = getattr(graph, name)
         if mask.dtype != torch.bool or mask.shape != (n,):
@@ -154,10 +181,12 @@ def load_imdb_graph(
     *,
     reverse_paths: bool = True,
     validate: bool = True,
+    shared_payload: dict | None = None,
 ) -> PainGraph:
     """Load one topology variant together with the shared IMDb contract."""
     shared_path, variant_path = Path(shared_path), Path(variant_path)
-    shared, variant = _torch_load(shared_path), _torch_load(variant_path)
+    shared = _torch_load(shared_path) if shared_payload is None else shared_payload
+    variant = _torch_load(variant_path)
     required_shared = {
         "x", "y", "node_type", "train_mask", "val_mask", "test_mask", "meta"
     }

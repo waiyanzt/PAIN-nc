@@ -1,5 +1,4 @@
-# Faithful PAIN architecture from the official ZINC experiment, adapted only
-# at the output: graph pooling is replaced by node-wise classification.
+# Joint v1-v4 PAIN training with an update-matched default budget.
 device: cuda:0
 
 data:
@@ -20,25 +19,22 @@ model:
   path_aggregation: sum
   jumping_knowledge: last
   use_node_types: true
-
-  # Chunking is exact: every path still contributes to the same sum.
   path_chunk_size: 100000
   checkpoint_chunks: true
-
-  # true is faster if the GPU can retain the complete path artifact.
-  # Set false to stream chunks from host memory.
   paths_on_device: true
 
 training:
-  selection_metric: macro_f1
+  selection_metric: mean_macro_f1
+  # Four variant updates per super-epoch. 250 super-epochs therefore cap the
+  # run at the same 1,000 optimizer updates as a 1,000-epoch baseline.
   epochs: 1000
+  super_epochs: 250
   learning_rate: 0.001
   weight_decay: 0.0
   lr_factor: 0.5
-  lr_patience: 20
+  lr_patience: 5
   min_learning_rate: 0.00001
-  early_stopping_patience: 80
+  early_stopping_patience: 20
   gradient_clip_norm: 5.0
   max_hours: 12
   deterministic: true
-

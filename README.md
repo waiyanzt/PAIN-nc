@@ -5,6 +5,9 @@ This repository adapts the official PAIN (PAth Isomorphism Network) model from
 classification. Graph pooling is omitted at the model output; the final PAIN
 node embeddings are passed to a node-wise classification head.
 
+The upstream-to-local architecture contract and intentional changes are recorded
+in `docs/PAIN_FIDELITY.md`.
+
 The current end-to-end benchmark is IMDb. DBLP and Freebase raw files are
 reserved for later work and are not used by this pipeline.
 
@@ -114,10 +117,15 @@ python -m experiments.node_classification.benchmark_imdb \
 ```
 
 Each run writes `results/imdb_nc/<variant>/seed<seed>.pt`. The artifact includes
-the complete configuration, validation-selected epoch, metrics, test node IDs,
+the complete configuration, validation-Macro-F1-selected epoch, metrics, test node IDs,
 class probabilities (`y_prob`), predictions, and labels. Aggregate run and
 mean/sample-standard-deviation tables are written beside those directories.
 Existing run artifacts are reused unless `--overwrite` is supplied.
+
+Every new run records mandatory resource telemetry: parameter/buffer/static model
+bytes, serialized checkpoint bytes, peak process RSS, training and inference CUDA
+allocated/reserved peaks, input artifact sizes, and device/runtime metadata. Older
+artifacts without this contract are rejected; use `--overwrite` to regenerate them.
 
 The faithful default is computationally expensive because each of five PAIN
 layers processes every rooted path. Important memory controls in
@@ -137,6 +145,36 @@ The convenience wrapper preprocesses, checks, and benchmarks:
 ```bash
 bash scripts/hpc/run_imdb_nc.sh
 ```
+
+## Joint graph-variant data augmentation
+
+The augmentation arm trains one PAIN model, optimizer, and checkpoint across
+IMDb `v1-v4`. One super-epoch visits every selected physical variant once in a
+seeded random order. Checkpoint selection maximizes mean validation Macro-F1;
+test metrics and aligned logits are emitted per variant together with pairwise
+Kendall tau and exact resume state.
+
+Preflight:
+
+```bash
+python -m experiments.node_classification.imdb_augmentation \
+  --config configs/imdb_nc_augmentation.yaml \
+  --variants v1 v2 v3 v4 \
+  --preflight-only
+```
+
+Three-seed run:
+
+```bash
+python -m experiments.node_classification.imdb_augmentation \
+  --config configs/imdb_nc_augmentation.yaml \
+  --variants v1 v2 v3 v4 \
+  --output-root results/imdb_nc_augmentation
+```
+
+Resume an interrupted run with the same configuration and output root by adding
+`--resume`. The default augmentation budget is update-matched: 250 super-epochs
+times four variants equals the 1,000-update cap of an independent baseline.
 
 ## Kendall tau
 
