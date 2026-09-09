@@ -200,15 +200,18 @@ validation MRR under that same protocol. Training uses all 19 false conference
 candidates per positive. This avoids the malformed sampled-negative protocol
 documented in `INV-RGCN-guide`.
 
-Start with an exact path census. It computes counts without materializing path
-tensors:
+Start with a path census. It reports the default sampled materialization count
+and the exhaustive count without writing tensors:
 
 ```bash
 python -m preprocessing.dblp_link_prediction --mode both --count-only
 ```
 
-If the reported exact size and expected runtime are acceptable, build all
-original, universal, and invariant artifacts:
+DBLP's exhaustive length-three programs contain billions of paths and are not
+practical to train. The default is therefore a deterministic per-root budget of
+256 sampled length-two/three paths. It keeps all root and one-hop paths and
+inverse-probability weights the longer samples to estimate PAIN's exhaustive
+sum aggregation. Build all original, universal, and invariant artifacts with:
 
 ```bash
 python -m preprocessing.dblp_link_prediction --mode both
@@ -228,20 +231,24 @@ v2 derived from training target blocks). The invariant compiler separately
 uses the guide's training-block scope so no held-out Paper-Conference topology
 is needed to make its three semantic programs identical.
 
-If exact paths are impractical, use a common deterministic per-root cap:
+Use a different common long-path budget only for a budget-sensitivity run:
 
 ```bash
 python -m preprocessing.dblp_link_prediction \
   --mode both \
-  --max-paths-per-root 1000
+  --max-paths-per-root 128
 ```
 
-Then set `data.artifact_tag: L3_cap1000` in `configs/dblp_lp.yaml`, or pass
-`--artifact-tag L3_cap1000` to the benchmark. The cap is applied after path
-deduplication and keyed by semantic node-path identity. Therefore all invariant
-variants select the same paths. Use the identical cap and seed for original,
-universal, and invariant arms, and report the experiment as sampled PAIN rather
-than exact PAIN.
+Then pass `--artifact-tag L3_stratcap128` to both benchmark programs (the
+checked-in configs default to `L3_stratcap256`). Sampling uses canonical ranks
+without enumerating all length-three paths and occurs after semantic
+deduplication/compilation. Use the identical budget, sampling seed, and policy
+for original, universal, augmentation, and invariant arms. Report every such
+result as sampled PAIN rather than exact PAIN.
+
+Exhaustive mode is still available for diagnostics with
+`--max-paths-per-root 0`; always combine it with `--count-only` before attempting
+materialization.
 
 Run the complete seven-arm, three-seed benchmark:
 

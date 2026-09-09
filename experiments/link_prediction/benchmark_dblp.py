@@ -99,6 +99,19 @@ def preflight(config: dict[str, Any], variants: list[str]) -> None:
         source_name = VARIANTS[display_name]
         path = data_dir / f"{source_name}_{artifact_tag}.pt"
         details = metadata["variants"][source_name]
+        required_provenance = {
+            "message_program_sha256",
+            "selected_path_program_sha256",
+            "path_sampling",
+            "sampling_seed",
+            "sampled_long_paths_per_root",
+        }
+        missing_provenance = sorted(required_provenance - details.keys())
+        if missing_provenance:
+            raise ValueError(
+                f"{source_name} metadata lacks sampling provenance: "
+                + ", ".join(missing_provenance)
+            )
         print(
             f"{display_name:16s} {path.stat().st_size / 2**30:8.2f} GiB  "
             f"paths={details['num_paths']:,} "
@@ -161,7 +174,7 @@ def main() -> None:
     parser.add_argument("--device")
     parser.add_argument(
         "--artifact-tag",
-        help="Override data.artifact_tag (for example L3_cap100000).",
+        help="Override data.artifact_tag (for example L3_stratcap256).",
     )
     parser.add_argument("--output-root", default="results/dblp_lp")
     parser.add_argument("--preflight-only", action="store_true")

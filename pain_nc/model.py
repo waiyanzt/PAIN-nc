@@ -208,16 +208,29 @@ class PathAggregator(nn.Module):
                     neighbor_mask,
                     distances,
                 )
+            path_weights = getattr(graph, "path_weights", None)
+            if path_weights is not None:
+                weights = path_weights[start:stop].to(
+                    x.device, dtype=messages.dtype, non_blocking=True
+                )
+                messages = messages * weights.unsqueeze(1)
+            else:
+                weights = None
             aggregate, segment_counts = self._deterministic_segment_add(
                 aggregate, roots, messages
             )
             if counts is not None:
-                unique_roots = torch.unique_consecutive(roots)
-                counts = counts.index_copy(
-                    0,
-                    unique_roots,
-                    counts[unique_roots] + segment_counts,
-                )
+                if weights is None:
+                    unique_roots = torch.unique_consecutive(roots)
+                    counts = counts.index_copy(
+                        0,
+                        unique_roots,
+                        counts[unique_roots] + segment_counts,
+                    )
+                else:
+                    counts, _ = self._deterministic_segment_add(
+                        counts, roots, weights.unsqueeze(1)
+                    )
         if counts is not None:
             aggregate = aggregate / counts.clamp_min(1)
         return aggregate

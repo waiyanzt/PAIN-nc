@@ -1,12 +1,13 @@
 # Faithful PAIN path encoder adapted to DBLP paper-conference link prediction.
-# The default artifact tag is exact L=3. If preprocessing uses, for example,
-# --max-paths-per-root 100000, change this to L3_cap100000 for every arm.
+# DBLP's exhaustive L=3 program contains billions of paths. The default
+# preprocessor uses a 256-path per-root budget for length-2/3 paths while
+# retaining length-0/1 paths exactly and inverse-probability weighting samples.
 device: cuda:0
 
 data:
   preprocessed_dir: data/preprocessed/DBLP
   shared_path: data/preprocessed/DBLP/shared.pt
-  artifact_tag: L3
+  artifact_tag: L3_stratcap256
 
 model:
   hidden_dim: 128

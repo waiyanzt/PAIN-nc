@@ -290,6 +290,22 @@ def train_one_run(
         "model": "PAIN-LP",
         "variant": variant,
         "variant_source_name": graph.variant_meta.get("variant"),
+        "message_program_sha256": graph.variant_meta.get("message_program_sha256"),
+        "selected_path_program_sha256": graph.variant_meta.get(
+            "selected_path_program_sha256"
+        ),
+        "selected_path_weights_sha256": graph.variant_meta.get(
+            "selected_path_weights_sha256"
+        ),
+        "path_sampling": graph.variant_meta.get("path_sampling", "none"),
+        "sampling_seed": graph.variant_meta.get("sampling_seed"),
+        "sampled_long_paths_per_root": graph.variant_meta.get(
+            "sampled_long_paths_per_root", 0
+        ),
+        "physical_graph_hashes": graph.variant_meta.get("physical_graph_hashes"),
+        "semantic_program_hashes": graph.variant_meta.get(
+            "semantic_program_hashes"
+        ),
         "seed": seed,
         "best_epoch": best_epoch,
         "epochs_trained": len(history),
@@ -319,7 +335,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", default="configs/dblp_lp.yaml")
     parser.add_argument("--variant", default="DBLP1")
-    parser.add_argument("--variant-path", default="data/preprocessed/DBLP/v1_L3.pt")
+    parser.add_argument(
+        "--variant-path",
+        default="data/preprocessed/DBLP/v1_L3_stratcap256.pt",
+    )
     parser.add_argument("--seed", type=int, default=1566911444)
     parser.add_argument("--device")
     parser.add_argument("--output", default="results/dblp_lp/DBLP1/seed1566911444.pt")
