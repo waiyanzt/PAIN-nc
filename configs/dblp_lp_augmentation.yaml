@@ -4,7 +4,7 @@ device: cuda:0
 data:
   preprocessed_dir: data/preprocessed/DBLP
   shared_path: data/preprocessed/DBLP/shared.pt
-  artifact_tag: L3
+  artifact_tag: L3_stratcap256
 
 model:
   hidden_dim: 128

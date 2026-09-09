@@ -34,6 +34,11 @@ neighbor marking, sum path aggregation, no dropout, and a two-layer head.
 - Heterogeneous node types and relation types receive learned embeddings.
 - Exact path processing is chunked, with optional activation checkpointing and
   CPU-to-GPU path streaming. These controls do not sample or discard paths.
+- DBLP cannot materialize its billion-path exhaustive programs. Its separately
+  labeled sampled-PAIN protocol retains all length-zero/one paths, directly
+  samples canonical length-two/three ranks per root, and applies inverse-
+  inclusion-probability weights before sum aggregation. This is a scalability
+  approximation and is not claimed to preserve PAIN's exact expressivity.
 - Root-sorted segment sums replace atomic CUDA scatter-add so repeated runs and
   future invariant comparisons can enforce deterministic algorithms.
 - The data container carries shared node supervision separately from each

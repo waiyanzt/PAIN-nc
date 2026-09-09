@@ -39,13 +39,29 @@ orders them canonically. PAIN enumerates paths only after this projection.
 
 ## Exact versus sampled paths
 
-Exact paths are the preferred headline because they preserve the faithful PAIN
-bias. Run `--count-only` before allocating storage. If exact enumeration is not
-feasible, `--max-paths-per-root K` retains the root-only path and selects the
-other paths by a stable hash of `(sampling_seed, semantic node path)`. Selection
-happens after set deduplication.
+The DBLP variants contain billions of exact length-three paths, so the runnable
+headline is **sampled PAIN**. Exhaustive mode remains available explicitly with
+`--max-paths-per-root 0`, but must first be assessed with `--count-only`.
 
-For a valid sampled comparison, `K`, the sampling seed, training budget,
+The default `--max-paths-per-root K` policy interprets `K` as the per-root
+budget for length-two and length-three paths. It:
+
+1. retains every length-zero and length-one path exactly;
+2. allocates `K` proportionally between the nonempty length-two and
+   length-three strata for each root, retaining at least one of each when the
+   budget permits;
+3. samples unique canonical path ranks directly with a repository-local
+   SplitMix64/Floyd sampler, without enumerating the length-three population;
+4. attaches inverse-inclusion-probability weights per root and length, so sum
+   aggregation estimates the exhaustive PAIN sum; and
+5. samples the invariant arm only after semantic compilation.
+
+Canonical rank selection depends only on the graph program, root, length, and
+sampling seed. Identical compiled programs therefore produce identical sampled
+path tensors and weights. Artifact metadata records the policy, selected counts,
+and hashes of both the selected path program and weights.
+
+For a valid sampled comparison, `K`, the sampling seed, sampling/weighting policy, training budget,
 candidate protocol, and checkpoint selection must be identical across every
 original, universal, augmentation, and invariant arm. Results must be labeled sampled PAIN.
 Physical-path sampling is allowed for the non-invariant baselines, but the
@@ -55,10 +71,11 @@ invariant arm must sample only after semantic compilation.
 
 1. The three source physical graph hashes differ.
 2. The three compiled semantic graph hashes match.
-3. Supervision, negatives, and candidate order share one hash/artifact.
-4. Same-seed invariant runs use one GPU architecture.
-5. Candidate logits and model checkpoints are byte-identical.
-6. Every matched-seed pair has Kendall tau exactly 1 and maximum score
+3. The selected semantic path-program and weight hashes match.
+4. Supervision, negatives, and candidate order share one hash/artifact.
+5. Same-seed invariant runs use one GPU architecture.
+6. Candidate logits and model checkpoints are byte-identical.
+7. Every matched-seed pair has Kendall tau exactly 1 and maximum score
    difference 0.
-7. Invariant performance is compared with both original and universal PAIN
+8. Invariant performance is compared with both original and universal PAIN
    under the same path budget.

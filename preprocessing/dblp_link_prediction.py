@@ -1,4 +1,4 @@
-"""Build exact PAIN path artifacts for DBLP paper-conference prediction.
+"""Build sampled or exhaustive PAIN paths for DBLP link prediction.
 
 The three physical variants attach research-area information to papers (v1),
 conferences (v2), or authors (v3).  The universal baseline is their edge union.
@@ -7,9 +7,9 @@ Paper-conference target edges are train-only in every message-passing graph.
 from __future__ import annotations
 
 import argparse
-import heapq
 import hashlib
 import json
+from bisect import bisect_left
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -522,38 +522,237 @@ def stable_path_key(path: tuple[int, ...], seed: int) -> int:
     return value
 
 
+UINT64_MASK = (1 << 64) - 1
+UINT64_RANGE = 1 << 64
+
+
+def _splitmix64(state: int) -> tuple[int, int]:
+    """Return the next state and value from a stable counter-style PRNG."""
+    state = (state + 0x9E3779B97F4A7C15) & UINT64_MASK
+    value = state
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & UINT64_MASK
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & UINT64_MASK
+    return state, (value ^ (value >> 31)) & UINT64_MASK
+
+
+def stable_sample_ranks(population: int, sample_size: int, seed: int) -> list[int]:
+    """Sample sorted unique integer ranks in O(sample_size) memory and time.
+
+    Floyd's algorithm avoids allocating or walking ``range(population)``.  A
+    repository-local SplitMix64 implementation makes the result independent of
+    NumPy and Python random-module versions.
+    """
+    if population < 0 or sample_size < 0 or sample_size > population:
+        raise ValueError("Invalid population/sample size")
+    if sample_size == 0:
+        return []
+    if sample_size == population:
+        return list(range(population))
+
+    state = int(seed) & UINT64_MASK
+    chosen: set[int] = set()
+
+    def randbelow(bound: int) -> int:
+        nonlocal state
+        limit = UINT64_RANGE - (UINT64_RANGE % bound)
+        while True:
+            state, value = _splitmix64(state)
+            if value < limit:
+                return value % bound
+
+    for upper in range(population - sample_size, population):
+        candidate = randbelow(upper + 1)
+        chosen.add(upper if candidate in chosen else candidate)
+    if len(chosen) != sample_size:
+        raise AssertionError("Floyd sampler produced duplicate ranks")
+    return sorted(chosen)
+
+
+def allocate_long_path_budget(
+    length_two: int,
+    length_three: int,
+    budget: int,
+) -> tuple[int, int]:
+    """Allocate a per-root budget proportionally while covering both lengths."""
+    counts = [int(length_two), int(length_three)]
+    if min(counts) < 0 or budget < 0:
+        raise ValueError("Path counts and budget must be non-negative")
+    total = sum(counts)
+    if total <= budget:
+        return counts[0], counts[1]
+    if budget == 0:
+        return 0, 0
+
+    allocations = [0, 0]
+    active = [index for index, count in enumerate(counts) if count]
+    # When possible, guarantee that both length strata are represented.  For a
+    # one-path budget, prefer the larger stratum (length three wins a tie).
+    if budget < len(active):
+        selected = sorted(active, key=lambda i: (counts[i], i), reverse=True)[:budget]
+        for index in selected:
+            allocations[index] = 1
+        return allocations[0], allocations[1]
+
+    for index in active:
+        allocations[index] = 1
+    remaining = budget - len(active)
+    capacities = [counts[i] - allocations[i] for i in range(2)]
+    capacity_total = sum(capacities)
+    if remaining and capacity_total:
+        numerators = [remaining * capacity for capacity in capacities]
+        extras = [numerator // capacity_total for numerator in numerators]
+        for index in range(2):
+            allocations[index] += extras[index]
+        leftover = remaining - sum(extras)
+        order = sorted(
+            range(2),
+            key=lambda i: (numerators[i] % capacity_total, capacities[i], i),
+            reverse=True,
+        )
+        for index in order:
+            if not leftover:
+                break
+            if allocations[index] < counts[index]:
+                allocations[index] += 1
+                leftover -= 1
+    if sum(allocations) != budget:
+        raise AssertionError("Long-path budget allocation is inconsistent")
+    return allocations[0], allocations[1]
+
+
+def selected_path_counts(
+    root_counts: np.ndarray,
+    long_path_budget: int,
+) -> np.ndarray:
+    """Return materialized counts by path length without selecting paths."""
+    if long_path_budget <= 0:
+        return root_counts.sum(axis=0).astype(np.int64, copy=True)
+    selected = np.zeros(PATH_LENGTH + 1, dtype=np.int64)
+    selected[:2] = root_counts[:, :2].sum(axis=0)
+    for row in root_counts:
+        count_two, count_three = allocate_long_path_budget(
+            int(row[2]), int(row[3]), long_path_budget
+        )
+        selected[2] += count_two
+        selected[3] += count_three
+    return selected
+
+
+def _nth_without(values: list[int], offset: int, excluded: tuple[int, ...]) -> int:
+    """Select an item from sorted values after removing known exclusions."""
+    index = int(offset)
+    for item in sorted(excluded):
+        position = bisect_left(values, item)
+        if position < len(values) and values[position] == item and position <= index:
+            index += 1
+    return values[index]
+
+
+def unrank_length_two_paths(
+    root: int,
+    adjacency: list[list[int]],
+    ranks: list[int],
+):
+    """Map canonical length-two ranks to paths without enumerating paths."""
+    rank_index = 0
+    block_start = 0
+    for first in adjacency[root]:
+        block_size = len(adjacency[first]) - 1
+        block_stop = block_start + block_size
+        while rank_index < len(ranks) and ranks[rank_index] < block_stop:
+            offset = ranks[rank_index] - block_start
+            second = _nth_without(adjacency[first], offset, (root,))
+            yield (root, first, second)
+            rank_index += 1
+        block_start = block_stop
+        if rank_index == len(ranks):
+            return
+    if rank_index != len(ranks):
+        raise IndexError("Length-two path rank is outside the population")
+
+
+def unrank_length_three_paths(
+    root: int,
+    adjacency: list[list[int]],
+    adjacency_sets: list[set[int]],
+    ranks: list[int],
+):
+    """Map canonical length-three ranks while walking only length-two prefixes."""
+    rank_index = 0
+    block_start = 0
+    for first in adjacency[root]:
+        for second in adjacency[first]:
+            if second == root:
+                continue
+            exclusions = (first, root) if root in adjacency_sets[second] else (first,)
+            block_size = len(adjacency[second]) - len(exclusions)
+            block_stop = block_start + block_size
+            while rank_index < len(ranks) and ranks[rank_index] < block_stop:
+                offset = ranks[rank_index] - block_start
+                third = _nth_without(adjacency[second], offset, exclusions)
+                yield (root, first, second, third)
+                rank_index += 1
+            block_start = block_stop
+            if rank_index == len(ranks):
+                return
+    if rank_index != len(ranks):
+        raise IndexError("Length-three path rank is outside the population")
+
+
 def selected_root_paths(
     root: int,
     adjacency: list[list[int]],
-    cap: int,
+    adjacency_sets: list[set[int]],
+    root_counts: np.ndarray,
+    long_path_budget: int,
     seed: int,
 ):
-    """Select paths after semantic deduplication, always retaining (root,)."""
-    if cap <= 0:
-        yield from iter_root_paths(root, adjacency)
+    """Yield ``(path, weight)`` using direct stratified path sampling.
+
+    Zero- and one-edge paths are exact.  Two- and three-edge paths receive a
+    proportional per-root budget and inverse-inclusion-probability weights so
+    their weighted sums estimate the exhaustive PAIN path sums.
+    """
+    if long_path_budget <= 0:
+        yield from ((path, 1.0) for path in iter_root_paths(root, adjacency))
         return
-    if cap == 1:
-        yield (root,)
-        return
-    heap: list[tuple[int, tuple[int, ...]]] = []
-    for path in iter_root_paths(root, adjacency):
-        if len(path) == 1:
+
+    exact_two, exact_three = int(root_counts[2]), int(root_counts[3])
+    sample_two, sample_three = allocate_long_path_budget(
+        exact_two, exact_three, long_path_budget
+    )
+    for length, exact, sampled, unrank in (
+        (3, exact_three, sample_three, unrank_length_three_paths),
+        (2, exact_two, sample_two, unrank_length_two_paths),
+    ):
+        if not sampled:
             continue
-        key = stable_path_key(path, seed)
-        item = (-key, path)
-        if len(heap) < cap - 1:
-            heapq.heappush(heap, item)
-        elif key < -heap[0][0]:
-            heapq.heapreplace(heap, item)
-    selected = [path for _negative_key, path in heap]
-    selected.sort(key=lambda path: (stable_path_key(path, seed), path))
-    yield from selected
-    yield (root,)
+        rank_seed = stable_path_key((root, length), seed)
+        ranks = stable_sample_ranks(exact, sampled, rank_seed)
+        paths = (
+            unrank(root, adjacency, adjacency_sets, ranks)
+            if length == 3
+            else unrank(root, adjacency, ranks)
+        )
+        weight = float(exact) / float(sampled)
+        yield from ((path, weight) for path in paths)
+    for first in adjacency[root]:
+        yield (root, first), 1.0
+    yield (root,), 1.0
 
 
-def estimated_compact_bytes(num_paths: int, width: int = 4) -> int:
-    # int32 path + edge indices, int8 neighbor + distance + length, int32 root.
-    return int(num_paths * (width * 4 * 2 + width + width + 1 + 4))
+def estimated_compact_bytes(
+    num_paths: int,
+    width: int = 4,
+    *,
+    weighted: bool = False,
+) -> int:
+    # int32 path + edge indices, int8 neighbor + distance + length, int32 root,
+    # and optional float32 inverse-probability weight.
+    bytes_per_path = width * 4 * 2 + width + width + 1 + 4
+    if weighted:
+        bytes_per_path += 4
+    return int(num_paths * bytes_per_path)
 
 
 def enumerate_pain_paths(
@@ -563,14 +762,9 @@ def enumerate_pain_paths(
     max_paths_per_root: int,
     sampling_seed: int,
 ) -> dict[str, torch.Tensor]:
-    """Materialize exact paths or a semantic-identity-keyed per-root sample."""
-    exact_per_root = root_counts.sum(axis=1)
-    selected_per_root = (
-        exact_per_root
-        if max_paths_per_root <= 0
-        else np.minimum(exact_per_root, max_paths_per_root)
-    )
-    total = int(selected_per_root.sum())
+    """Materialize exhaustive paths or a direct weighted per-root sample."""
+    selected_counts = selected_path_counts(root_counts, max_paths_per_root)
+    total = int(selected_counts.sum())
     width = PATH_LENGTH + 1
     path_index = np.full((width, total), -10, dtype=np.int32)
     path_edge_idx = np.full((width, total), -10, dtype=np.int32)
@@ -578,10 +772,13 @@ def enumerate_pain_paths(
     distances = np.full((total, width), PATH_LENGTH, dtype=np.int8)
     path_lengths = np.empty(total, dtype=np.int8)
     roots = np.empty(total, dtype=np.int32)
+    path_weights = (
+        np.empty(total, dtype=np.float32) if max_paths_per_root > 0 else None
+    )
     adjacency_sets = [set(neighbors) for neighbors in adjacency]
     cursor = 0
 
-    def emit(path: tuple[int, ...]) -> None:
+    def emit(path: tuple[int, ...], weight: float) -> None:
         nonlocal cursor
         size, root = len(path), path[0]
         path_index[:size, cursor] = path
@@ -607,17 +804,24 @@ def enumerate_pain_paths(
             distances[cursor, position] = distance
         path_lengths[cursor] = size
         roots[cursor] = root
+        if path_weights is not None:
+            path_weights[cursor] = weight
         cursor += 1
 
     for root in range(len(adjacency)):
         yield_paths = selected_root_paths(
-            root, adjacency, max_paths_per_root, sampling_seed
+            root,
+            adjacency,
+            adjacency_sets,
+            root_counts[root],
+            max_paths_per_root,
+            sampling_seed,
         )
-        for path in yield_paths:
-            emit(path)
+        for path, weight in yield_paths:
+            emit(path, weight)
     if cursor != total:
         raise AssertionError(f"filled {cursor} paths, expected {total}")
-    return {
+    result = {
         "path_index": torch.from_numpy(path_index),
         "path_lengths": torch.from_numpy(path_lengths),
         "mask_index": torch.from_numpy(roots),
@@ -625,6 +829,9 @@ def enumerate_pain_paths(
         "neighbor_mask": torch.from_numpy(neighbor_mask),
         "distances": torch.from_numpy(distances),
     }
+    if path_weights is not None:
+        result["path_weights"] = torch.from_numpy(path_weights)
+    return result
 
 
 def tensor_hash(tensors: Iterable[torch.Tensor]) -> str:
@@ -696,6 +903,11 @@ def preprocess(
 ) -> None:
     if max_paths_per_root < 0:
         raise ValueError("max_paths_per_root must be non-negative")
+    if max_paths_per_root == 1:
+        raise ValueError(
+            "A sampled long-path budget must be at least 2 so nonempty "
+            "length-2 and length-3 strata can both be represented"
+        )
     contract = build_contract(raw_dir, seed, min_conf)
     # Ordinary and augmentation artifacts reproduce the existing cross-GNN
     # DBLP variants: all auxiliary P-Area/A-Author labels are visible, while
@@ -706,17 +918,28 @@ def preprocess(
         save_shared(contract, output_dir, raw_dir, seed)
     sampling_mode = (
         "none" if max_paths_per_root == 0
-        else "semantic_identity_keyed_cap_after_deduplication"
+        else "direct_length_stratified_inverse_probability"
     )
     artifact_tag = f"L{PATH_LENGTH}"
     if max_paths_per_root:
-        artifact_tag += f"_cap{max_paths_per_root}"
+        artifact_tag += f"_stratcap{max_paths_per_root}"
     summary: dict = {
         "path_length": PATH_LENGTH,
         "path_semantics": "all_rooted_simple_paths_up_to_L",
         "path_sampling": sampling_mode,
-        "max_paths_per_root": max_paths_per_root,
+        "sampled_long_paths_per_root": max_paths_per_root,
         "sampling_seed": sampling_seed,
+        "sampling_short_path_policy": "retain_all_length_0_and_1",
+        "sampling_long_path_allocation": (
+            "exhaustive"
+            if max_paths_per_root == 0
+            else "per_root_proportional_length_2_and_3"
+        ),
+        "sampling_weighting": (
+            "none"
+            if max_paths_per_root == 0
+            else "inverse_inclusion_probability_by_root_and_length"
+        ),
         "artifact_tag": artifact_tag,
         "num_candidates": contract.counts["conference"],
         "node_counts": contract.counts,
@@ -737,14 +960,10 @@ def preprocess(
         root_counts = path_counts_by_root(adjacency)
         counts = tuple(int(value) for value in root_counts.sum(axis=0))
         exact_total = sum(counts)
-        paths_per_root = root_counts.sum(axis=1)
-        materialized_total = int(
-            (
-                paths_per_root
-                if max_paths_per_root == 0
-                else np.minimum(paths_per_root, max_paths_per_root)
-            ).sum()
+        materialized_counts = selected_path_counts(
+            root_counts, max_paths_per_root
         )
+        materialized_total = int(materialized_counts.sum())
         leakage = validate_no_target_leakage(relation_edges, contract.splits)
         details = {
             "dataset": "DBLP",
@@ -753,16 +972,31 @@ def preprocess(
             "path_length": PATH_LENGTH,
             "path_semantics": "all_rooted_simple_paths_up_to_L",
             "path_sampling": sampling_mode,
-            "max_paths_per_root": max_paths_per_root,
+            "sampled_long_paths_per_root": max_paths_per_root,
             "sampling_seed": sampling_seed,
+            "sampling_short_path_policy": "retain_all_length_0_and_1",
+            "sampling_long_path_allocation": (
+                "per_root_proportional_length_2_and_3_with_nonempty_coverage"
+            ),
+            "sampling_selection": (
+                "canonical_rank_without_replacement_splitmix64_floyd"
+            ),
+            "sampling_weighting": (
+                "inverse_inclusion_probability_by_root_and_length"
+                if max_paths_per_root
+                else "none"
+            ),
             "path_order": "root_major_descending_length",
             "num_nodes": int(contract.node_type.numel()),
             "num_undirected_edges": int(edge_index.shape[1] // 2),
             "num_directed_edges": int(edge_index.shape[1]),
             "paths_exact_length_0_1_2_3": list(counts),
+            "paths_materialized_length_0_1_2_3": materialized_counts.tolist(),
             "num_exact_paths": exact_total,
             "num_paths": materialized_total,
-            "estimated_compact_path_bytes": estimated_compact_bytes(materialized_total),
+            "estimated_compact_path_bytes": estimated_compact_bytes(
+                materialized_total, weighted=max_paths_per_root > 0
+            ),
             "edge_type_names": list(EDGE_TYPE_NAMES),
             "message_program_sha256": tensor_hash((edge_index, edge_type)),
             "target_relation_policy": "paper_conference_train_only",
@@ -777,7 +1011,8 @@ def preprocess(
             f"edges={details['num_undirected_edges']:,} "
             f"paths={materialized_total:,}/{exact_total:,} "
             f"compact_estimate={details['estimated_compact_path_bytes'] / 2**30:.2f} GiB "
-            f"counts={counts}",
+            f"selected_counts={tuple(int(v) for v in materialized_counts)} "
+            f"exact_counts={counts}",
             flush=True,
         )
         if count_only:
@@ -789,6 +1024,17 @@ def preprocess(
             max_paths_per_root,
             sampling_seed,
         )
+        hash_fields = (
+            "path_index", "path_lengths", "mask_index", "path_edge_idx",
+            "neighbor_mask", "distances",
+        )
+        details["selected_path_program_sha256"] = tensor_hash(
+            paths[field] for field in hash_fields
+        )
+        if "path_weights" in paths:
+            details["selected_path_weights_sha256"] = tensor_hash(
+                (paths["path_weights"],)
+            )
         payload = {
             "edge_index": edge_index,
             "edge_type": edge_type,
@@ -892,10 +1138,13 @@ def parse_args() -> argparse.Namespace:
         help="Build original/universal arms, the compiled invariant arm, or both.",
     )
     parser.add_argument(
-        "--max-paths-per-root", type=int, default=0,
+        "--max-paths-per-root", "--long-path-budget-per-root",
+        dest="max_paths_per_root", type=int, default=256,
         help=(
-            "0 keeps every path; a positive value enables deterministic "
-            "semantic-identity-keyed sampling after path deduplication."
+            "Per-root budget for directly sampled length-2/3 paths (default: "
+            "256; minimum positive value: 2). 0 requests exhaustive paths. "
+            "Length-0/1 paths are retained exactly and sampled paths receive inverse-"
+            "probability weights."
         ),
     )
     parser.add_argument("--sampling-seed", type=int, default=SEED)

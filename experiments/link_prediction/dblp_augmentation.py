@@ -123,6 +123,15 @@ def prepare_graphs(
                 if not torch.equal(reference_splits[name], splits[name]):
                     raise ValueError(f"Shared supervision differs for {variant}: {name}")
     reference = cpu_graphs[VARIANTS[0]]
+    sampling_fields = (
+        "path_sampling",
+        "sampling_seed",
+        "sampled_long_paths_per_root",
+        "sampling_short_path_policy",
+        "sampling_long_path_allocation",
+        "sampling_selection",
+        "sampling_weighting",
+    )
     for variant, graph in cpu_graphs.items():
         if (
             graph.num_nodes != reference.num_nodes
@@ -130,6 +139,11 @@ def prepare_graphs(
             or graph.num_edge_types != reference.num_edge_types
         ):
             raise ValueError(f"Graph vocabulary differs for {variant}")
+        for field in sampling_fields:
+            if graph.variant_meta.get(field) != reference.variant_meta.get(field):
+                raise ValueError(
+                    f"Sampling provenance differs for {variant}: {field}"
+                )
     move_paths = bool(config["model"].get("paths_on_device", False))
     graphs = {
         variant: graph.to(device, move_paths=move_paths)
@@ -214,6 +228,20 @@ def run_seed(
         "variants": list(VARIANTS),
         "config": copy.deepcopy(config),
         "input_paths": {name: str(path.resolve()) for name, path in input_paths.items()},
+        "sampling_provenance": {
+            name: {
+                field: graph.variant_meta.get(field)
+                for field in (
+                    "message_program_sha256",
+                    "selected_path_program_sha256",
+                    "selected_path_weights_sha256",
+                    "path_sampling",
+                    "sampling_seed",
+                    "sampled_long_paths_per_root",
+                )
+            }
+            for name, graph in graphs.items()
+        },
     }
     history = []
     completed_steps = completed_super_epochs = 0

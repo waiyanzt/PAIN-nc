@@ -153,7 +153,10 @@ def group_paths_by_root(payload: dict) -> None:
     order = torch.argsort(roots, stable=True)
     for name in ("path_index", "path_edge_idx"):
         payload[name] = payload[name].index_select(1, order)
-    for name in ("path_lengths", "mask_index", "neighbor_mask", "distances"):
+    row_fields = ["path_lengths", "mask_index", "neighbor_mask", "distances"]
+    if "path_weights" in payload:
+        row_fields.append("path_weights")
+    for name in row_fields:
         payload[name] = payload[name].index_select(0, order)
 
     payload["meta"] = dict(payload.get("meta", {}))

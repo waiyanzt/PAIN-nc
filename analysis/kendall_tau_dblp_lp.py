@@ -71,7 +71,10 @@ def load_run(root: Path, variant: str, seed: int) -> dict:
     artifact = torch.load(path, map_location="cpu", weights_only=False)
     required = {
         "candidate_scores", "candidate_ids", "test_queries",
-        "test_positive_tails", "model_state_dict",
+        "test_positive_tails", "model_state_dict", "message_program_sha256",
+        "selected_path_program_sha256", "path_sampling", "sampling_seed",
+        "sampled_long_paths_per_root", "physical_graph_hashes",
+        "semantic_program_hashes",
     }
     missing = sorted(required - artifact.keys())
     if missing:
@@ -111,8 +114,38 @@ def main() -> None:
         }
         for left_name, right_name in combinations(args.variants, 2):
             left, right = runs[left_name], runs[right_name]
+            physical_hashes = left["physical_graph_hashes"]
+            semantic_hashes = left["semantic_program_hashes"]
+            if (
+                not isinstance(physical_hashes, dict)
+                or len(physical_hashes) != 3
+                or len(set(physical_hashes.values())) != 3
+            ):
+                raise ValueError("Invariant source physical graph hashes are not distinct")
+            if (
+                not isinstance(semantic_hashes, dict)
+                or len(semantic_hashes) != 3
+                or len(set(semantic_hashes.values())) != 1
+            ):
+                raise ValueError("Invariant compiled semantic graph hashes do not match")
             for field in ("candidate_ids", "test_queries", "test_positive_tails"):
                 aligned(left, right, field)
+            provenance_fields = (
+                "message_program_sha256",
+                "selected_path_program_sha256",
+                "selected_path_weights_sha256",
+                "path_sampling",
+                "sampling_seed",
+                "sampled_long_paths_per_root",
+                "physical_graph_hashes",
+                "semantic_program_hashes",
+            )
+            for field in provenance_fields:
+                if left.get(field) != right.get(field):
+                    raise ValueError(
+                        f"Run provenance failed: {field} differs between "
+                        f"{left_name} and {right_name}"
+                    )
             left_scores = left["candidate_scores"].numpy()
             right_scores = right["candidate_scores"].numpy()
             difference = left_scores - right_scores

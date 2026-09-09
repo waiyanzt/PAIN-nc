@@ -23,6 +23,7 @@ class PainLinkGraph:
     path_edge_idx: torch.Tensor
     neighbor_mask: torch.Tensor
     distances: torch.Tensor
+    path_weights: torch.Tensor | None
     shared_meta: dict[str, Any]
     variant_meta: dict[str, Any]
 
@@ -52,7 +53,7 @@ class PainLinkGraph:
     ) -> "PainLinkGraph":
         """Move small tensors eagerly and optionally retain the path store on CPU."""
         device = torch.device(device)
-        path_names = set(PATH_FIELDS)
+        path_names = {*PATH_FIELDS, "path_weights"}
         values: dict[str, Any] = {}
         for item in fields(self):
             value = getattr(self, item.name)
@@ -96,6 +97,15 @@ def validate_link_graph(
         actual = tuple(getattr(graph, name).shape)
         if actual != shape:
             raise ValueError(f"{name} has shape {actual}, expected {shape}")
+    if graph.path_weights is not None:
+        if tuple(graph.path_weights.shape) != (p,):
+            raise ValueError(
+                f"path_weights has shape {tuple(graph.path_weights.shape)}, expected {(p,)}"
+            )
+        if not bool(torch.isfinite(graph.path_weights).all()) or bool(
+            torch.any(graph.path_weights <= 0)
+        ):
+            raise ValueError("path_weights must be finite and positive")
     if p == 0:
         raise ValueError("A PAIN graph must contain at least its zero-edge paths")
     if int(graph.path_lengths.min()) < 1 or int(graph.path_lengths.max()) > width:
@@ -152,6 +162,7 @@ def load_dblp_link_graph(
         path_edge_idx=variant["path_edge_idx"],
         neighbor_mask=variant["neighbor_mask"],
         distances=variant["distances"],
+        path_weights=variant.get("path_weights"),
         shared_meta=shared["meta"],
         variant_meta=variant["meta"],
     )
