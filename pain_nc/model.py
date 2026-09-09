@@ -14,6 +14,7 @@ from torch.nn.utils.rnn import pack_padded_sequence
 from torch.utils.checkpoint import checkpoint
 
 from .data import PainGraph
+from .link_data import PainLinkGraph
 
 
 class PathAggregator(nn.Module):
@@ -58,9 +59,17 @@ class PathAggregator(nn.Module):
             input_dim, hidden_dim, num_layers=lstm_depth, batch_first=False
         )
 
-    def _device_chunk(self, tensor: torch.Tensor, start: int, stop: int, device: torch.device) -> torch.Tensor:
+    def _device_chunk(
+        self,
+        tensor: torch.Tensor,
+        start: int,
+        stop: int,
+        device: torch.device,
+        *,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
         chunk = tensor[..., start:stop]
-        return chunk.to(device, non_blocking=True)
+        return chunk.to(device, dtype=dtype, non_blocking=True)
 
     @staticmethod
     def _deterministic_segment_add(
@@ -122,7 +131,7 @@ class PathAggregator(nn.Module):
         sequence = F.dropout(sequence, p=self.dropout, training=self.training)
         packed = pack_padded_sequence(
             sequence,
-            path_lengths.cpu(),
+            path_lengths.cpu().long(),
             batch_first=False,
             enforce_sorted=False,
         )
@@ -133,16 +142,30 @@ class PathAggregator(nn.Module):
         total = graph.num_paths
         aggregate = x.new_zeros((graph.num_nodes, self.hidden_dim))
         counts = x.new_zeros((graph.num_nodes, 1)) if self.aggregation == "mean" else None
-        edge_type = graph.edge_type.to(x.device, non_blocking=True)
+        edge_type = graph.edge_type.to(
+            x.device, dtype=torch.long, non_blocking=True
+        )
 
         for start in range(0, total, self.chunk_size):
             stop = min(start + self.chunk_size, total)
-            path_index = self._device_chunk(graph.path_index, start, stop, x.device)
-            path_edge_idx = self._device_chunk(graph.path_edge_idx, start, stop, x.device)
-            neighbor_mask = graph.neighbor_mask[start:stop].to(x.device, non_blocking=True)
-            distances = graph.distances[start:stop].to(x.device, non_blocking=True)
+            # DBLP artifacts use compact integer dtypes on disk/host memory.
+            # Embedding lookup indices are widened only for the active GPU chunk.
+            path_index = self._device_chunk(
+                graph.path_index, start, stop, x.device, dtype=torch.long
+            )
+            path_edge_idx = self._device_chunk(
+                graph.path_edge_idx, start, stop, x.device, dtype=torch.long
+            )
+            neighbor_mask = graph.neighbor_mask[start:stop].to(
+                x.device, dtype=torch.long, non_blocking=True
+            )
+            distances = graph.distances[start:stop].to(
+                x.device, dtype=torch.long, non_blocking=True
+            )
             lengths = graph.path_lengths[start:stop]
-            roots = graph.mask_index[start:stop].to(x.device, non_blocking=True)
+            roots = graph.mask_index[start:stop].to(
+                x.device, dtype=torch.long, non_blocking=True
+            )
 
             def encode(
                 features: torch.Tensor,
@@ -314,3 +337,112 @@ class PainNodeClassifier(nn.Module):
 
     def forward(self, graph: PainGraph) -> torch.Tensor:
         return self.classifier(self.node_embeddings(graph))
+
+
+class PainLinkPredictor(nn.Module):
+    """Faithful PAIN encoder with a dot-product link-prediction decoder.
+
+    DBLP has no shared input-feature matrix in the existing benchmark contract,
+    so the input representation is a learned node-id embedding plus the same
+    learned node-type embedding used by PAIN-NC.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_nodes: int,
+        num_node_types: int,
+        num_edge_types: int,
+        hidden_dim: int = 128,
+        num_layers: int = 5,
+        lstm_depth: int = 2,
+        path_length: int = 3,
+        dropout: float = 0.0,
+        share_lstm: bool = True,
+        mark_neighbors: bool = True,
+        shortest_path_encoding: bool = False,
+        path_aggregation: Literal["sum", "mean"] = "sum",
+        jumping_knowledge: Literal["last", "mean", "concat"] = "last",
+        path_chunk_size: int = 50_000,
+        checkpoint_chunks: bool = True,
+        use_node_types: bool = True,
+        node_embedding_init_std: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if num_layers < 1 or path_chunk_size < 1:
+            raise ValueError("num_layers and path_chunk_size must be positive")
+        if node_embedding_init_std <= 0:
+            raise ValueError("node_embedding_init_std must be positive")
+        self.num_layers = num_layers
+        self.jumping_knowledge = jumping_knowledge
+        self.node_embedding = nn.Embedding(num_nodes, hidden_dim)
+        nn.init.normal_(self.node_embedding.weight, std=node_embedding_init_std)
+        self.node_type_embedding = (
+            nn.Embedding(num_node_types, hidden_dim) if use_node_types else None
+        )
+
+        lstm_input_dim = hidden_dim * 3 + int(mark_neighbors)
+        shared_lstm = (
+            nn.LSTM(
+                lstm_input_dim,
+                hidden_dim,
+                num_layers=lstm_depth,
+                batch_first=False,
+            )
+            if share_lstm
+            else None
+        )
+        self.layers = nn.ModuleList()
+        for _ in range(num_layers):
+            aggregator = PathAggregator(
+                hidden_dim,
+                path_length,
+                lstm_depth,
+                num_edge_types,
+                mark_neighbors=mark_neighbors,
+                shortest_path_encoding=shortest_path_encoding,
+                aggregation=path_aggregation,
+                dropout=dropout,
+                chunk_size=path_chunk_size,
+                checkpoint_chunks=checkpoint_chunks,
+                lstm=shared_lstm,
+            )
+            self.layers.append(PainLayer(aggregator, hidden_dim, dropout))
+
+        if jumping_knowledge == "concat":
+            self.decoder_projection: nn.Module = nn.Linear(
+                hidden_dim * num_layers, hidden_dim
+            )
+        else:
+            self.decoder_projection = nn.Identity()
+
+    def node_embeddings(self, graph: PainLinkGraph) -> torch.Tensor:
+        node_ids = torch.arange(graph.num_nodes, device=graph.node_type.device)
+        x = self.node_embedding(node_ids)
+        if self.node_type_embedding is not None:
+            x = x + self.node_type_embedding(graph.node_type.long())
+        layer_outputs = []
+        for layer in self.layers:
+            x = layer(x, graph)
+            layer_outputs.append(x)
+        if self.jumping_knowledge == "last":
+            representation = layer_outputs[-1]
+        elif self.jumping_knowledge == "mean":
+            representation = torch.stack(layer_outputs).mean(dim=0)
+        elif self.jumping_knowledge == "concat":
+            representation = torch.cat(layer_outputs, dim=-1)
+        else:
+            raise ValueError(
+                f"Unknown jumping_knowledge={self.jumping_knowledge!r}"
+            )
+        return self.decoder_projection(representation)
+
+    @staticmethod
+    def score_pairs(embeddings: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
+        return (
+            embeddings[pairs[:, 0].long()]
+            * embeddings[pairs[:, 1].long()]
+        ).sum(dim=-1)
+
+    def forward(self, graph: PainLinkGraph, pairs: torch.Tensor) -> torch.Tensor:
+        return self.score_pairs(self.node_embeddings(graph), pairs)

@@ -1,0 +1,45 @@
+# One PAIN model/optimizer trained across DBLP v1-v3 in seeded random order.
+device: cuda:0
+
+data:
+  preprocessed_dir: data/preprocessed/DBLP
+  shared_path: data/preprocessed/DBLP/shared.pt
+  artifact_tag: L3
+
+model:
+  hidden_dim: 128
+  num_layers: 5
+  lstm_depth: 2
+  path_length: 3
+  dropout: 0.0
+  share_lstm: true
+  reverse_paths: true
+  mark_neighbors: true
+  shortest_path_encoding: false
+  path_aggregation: sum
+  jumping_knowledge: last
+  use_node_types: true
+  node_embedding_init_std: 0.1
+  path_chunk_size: 50000
+  checkpoint_chunks: true
+  paths_on_device: false
+
+training:
+  epochs: 1000
+  # Caps the arm at the independent arm's 1,000 optimizer updates. Early
+  # stopping or max_hours may end it sooner; the exact count is recorded.
+  optimizer_steps: 1000
+  learning_rate: 0.005
+  weight_decay: 0.001
+  # 67 validation checks correspond to roughly 201 graph updates.
+  early_stopping_patience: 67
+  gradient_clip_norm: 5.0
+  embedding_regularization: 0.000001
+  max_hours: 22
+  deterministic: true
+
+evaluation:
+  protocol: filtered_full_conference_ranking
+  num_candidates: 20
+  hits_k: [1, 3, 5, 10]
+  threshold: 0.5

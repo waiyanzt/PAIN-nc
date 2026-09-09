@@ -60,11 +60,16 @@ The following must remain separately named and reported:
 - **Vanilla PAIN:** independently trained on one physical graph.
 - **Universal PAIN:** independently trained on the union graph.
 - **PAIN augmentation:** one model and optimizer trained across physical variants.
-- **Invariant PAIN:** a future conditional semantic-path extension.
+- **Invariant PAIN:** the DBLP preprocessing-time semantic-path compiler in
+  `preprocessing/dblp_link_prediction.py`. It compiles each physical Area
+  realization to one canonical relation graph before exact or semantic-keyed
+  sampled PAIN paths are enumerated.
 
-Joint augmentation does not imply information invariance. Invariant PAIN will
-require context/propagation separation, skip-node exclusion, semantic
-deduplication, canonical ordering, and deterministic reductions.
+Joint augmentation does not imply information invariance. The DBLP invariant
+arm enforces context/propagation separation, context-only skip-node exclusion,
+semantic deduplication, canonical ordering, and deterministic reductions. Its
+preprocessor aborts unless raw physical hashes differ and compiled semantic
+hashes match across DBLP1-3.
 
 ## Dataset-contract caveat
 
