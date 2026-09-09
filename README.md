@@ -1,4 +1,4 @@
-# PAIN Node Classification
+# PAIN Node Classification and Link Prediction
 
 This repository adapts the official PAIN (PAth Isomorphism Network) model from
 *The Expressive Power of Path-Based Graph Neural Networks* to node
@@ -8,8 +8,9 @@ node embeddings are passed to a node-wise classification head.
 The upstream-to-local architecture contract and intentional changes are recorded
 in `docs/PAIN_FIDELITY.md`.
 
-The current end-to-end benchmark is IMDb. DBLP and Freebase raw files are
-reserved for later work and are not used by this pipeline.
+The end-to-end benchmarks are IMDb node classification and DBLP
+paper-conference link prediction. DBLP includes original physical variants, a
+universal union baseline, and a compiled invariant PAIN arm.
 
 ## What is faithful and what changed
 
@@ -190,14 +191,102 @@ The analysis validates identical test node order and labels before computing
 node-level Kendall tau-b, then reports the mean and sample standard deviation
 over matched seeds.
 
+## DBLP paper-conference link prediction
+
+DBLP uses one canonical paper-disjoint 70/10/20 split. Message-passing graphs
+contain training paper-conference edges only. Evaluation ranks each held-out
+paper against all 20 conferences with filtered ranking; checkpoint selection is
+validation MRR under that same protocol. Training uses all 19 false conference
+candidates per positive. This avoids the malformed sampled-negative protocol
+documented in `INV-RGCN-guide`.
+
+Start with an exact path census. It computes counts without materializing path
+tensors:
+
+```bash
+python -m preprocessing.dblp_link_prediction --mode both --count-only
+```
+
+If the reported exact size and expected runtime are acceptable, build all
+original, universal, and invariant artifacts:
+
+```bash
+python -m preprocessing.dblp_link_prediction --mode both
+```
+
+The invariant arm does not train on a renamed physical graph. For each of
+DBLP1-3, preprocessing matches the variant-specific Area context, projects it
+to a canonical semantic relation program, and verifies that physical hashes
+differ while semantic hashes match. Exact rooted PAIN paths are then generated
+from the compiled program. One deduplicated `invariant_L3.pt` path store is
+shared by the three independently trained invariant runs; its metadata carries
+all three source-graph and compiler audits.
+
+The ordinary v1-v3 and augmentation artifacts retain the same Area-information
+scope as the existing cross-GNN DBLP datasets (all auxiliary v1/v3 Area labels;
+v2 derived from training target blocks). The invariant compiler separately
+uses the guide's training-block scope so no held-out Paper-Conference topology
+is needed to make its three semantic programs identical.
+
+If exact paths are impractical, use a common deterministic per-root cap:
+
+```bash
+python -m preprocessing.dblp_link_prediction \
+  --mode both \
+  --max-paths-per-root 1000
+```
+
+Then set `data.artifact_tag: L3_cap1000` in `configs/dblp_lp.yaml`, or pass
+`--artifact-tag L3_cap1000` to the benchmark. The cap is applied after path
+deduplication and keyed by semantic node-path identity. Therefore all invariant
+variants select the same paths. Use the identical cap and seed for original,
+universal, and invariant arms, and report the experiment as sampled PAIN rather
+than exact PAIN.
+
+Run the complete seven-arm, three-seed benchmark:
+
+```bash
+python -m experiments.link_prediction.benchmark_dblp \
+  --config configs/dblp_lp.yaml \
+  --output-root results/dblp_lp
+```
+
+Keep every matched invariance run on the same GPU architecture (for example,
+all V100s); mixing GPU architectures can break bitwise equality even when
+semantic hashes match. After all independent runs complete, audit the invariant
+arm with:
+
+```bash
+python -m analysis.kendall_tau_dblp_lp \
+  --root results/dblp_lp \
+  --output reports/kendall_tau_dblp_lp_invariant.csv
+```
+
+The audit requires aligned candidate scores, model checkpoints, and every
+pairwise Kendall tau to be exactly equal across the three invariant runs. It
+writes `reports/kendall_tau_dblp_lp_invariant.csv` and fails closed otherwise.
+
+The augmentation arm uses the same seeds and a maximum 1,000-update budget;
+early stopping and the exact optimizer-step count are recorded:
+
+```bash
+python -m experiments.link_prediction.dblp_augmentation \
+  --config configs/dblp_lp_augmentation.yaml \
+  --output-root results/dblp_lp_augmentation
+```
+
+Add `--resume` after a time-limited interruption.
+
 ## Repository layout
 
 ```text
-preprocessing/                 raw IMDb -> shared and exact L=3 path tensors
-pain_nc/                       loader and PAIN node-classification model
+preprocessing/                 raw IMDb/DBLP -> shared and L=3 path tensors
+pain_nc/                       PAIN node-classification and link models
 configs/imdb_nc.yaml           faithful default experiment configuration
 experiments/node_classification/
                                training and multi-variant benchmark
+experiments/link_prediction/   DBLP training and seven-arm benchmark
+configs/dblp_lp.yaml           corrected full-ranking DBLP contract
 analysis/                      matched-seed Kendall tau analysis
 scripts/hpc/                   cluster-side pipeline wrapper
 ```
