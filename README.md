@@ -211,19 +211,30 @@ DBLP's exhaustive length-three programs contain billions of paths and are not
 practical to train. The default is therefore a deterministic per-root budget of
 256 sampled length-two/three paths. It keeps all root and one-hop paths and
 inverse-probability weights the longer samples to estimate PAIN's exhaustive
-sum aggregation. Build all original, universal, and invariant artifacts with:
+sum aggregation. Build the ordinary/augmentation artifacts with:
 
 ```bash
-python -m preprocessing.dblp_link_prediction --mode both
+python -m preprocessing.dblp_link_prediction --mode baseline
 ```
 
-The invariant arm does not train on a renamed physical graph. For each of
-DBLP1-3, preprocessing matches the variant-specific Area context, projects it
-to a canonical semantic relation program, and verifies that physical hashes
-differ while semantic hashes match. Exact rooted PAIN paths are then generated
-from the compiled program. One deduplicated `invariant_L3.pt` path store is
-shared by the three independently trained invariant runs; its metadata carries
-all three source-graph and compiler audits.
+Build the invariant artifacts separately so running baseline/augmentation data
+is not overwritten:
+
+```bash
+python -m preprocessing.dblp_link_prediction \
+  --mode invariant --output-dir data/preprocessed/DBLP_invariant \
+  --max-paths-per-root 256 --sampling-seed 1566911444
+```
+
+For each of DBLP1-3, preprocessing matches the variant-specific physical Area
+context and projects licensed relations before PAIN path sampling. It generates
+`invariant_v1`, `invariant_v2`, and `invariant_v3` path artifacts independently,
+then verifies the complete model-facing path tensors and weights match. The
+training-only Area certificate used to disambiguate contexts is disclosed in
+metadata. The resulting paths equal those of the train-scope union closure;
+this is a dataset-specific invariant mapping, not a general proof of the
+paper's minimality or expressivity theorems for sampled PAIN. See
+`docs/DBLP_LP_CONTRACT.md` for the method and population caveats.
 
 The ordinary v1-v3 and augmentation artifacts retain the same Area-information
 scope as the existing cross-GNN DBLP datasets (all auxiliary v1/v3 Area labels;
@@ -235,7 +246,9 @@ Use a different common long-path budget only for a budget-sensitivity run:
 
 ```bash
 python -m preprocessing.dblp_link_prediction \
-  --mode both \
+  --mode baseline --max-paths-per-root 128
+python -m preprocessing.dblp_link_prediction \
+  --mode invariant --output-dir data/preprocessed/DBLP_invariant \
   --max-paths-per-root 128
 ```
 
@@ -250,12 +263,18 @@ Exhaustive mode is still available for diagnostics with
 `--max-paths-per-root 0`; always combine it with `--count-only` before attempting
 materialization.
 
-Run the complete seven-arm, three-seed benchmark:
+Run the ordinary four-arm benchmark and the invariant three-arm benchmark with
+separate result roots:
 
 ```bash
 python -m experiments.link_prediction.benchmark_dblp \
   --config configs/dblp_lp.yaml \
+  --variants DBLP1 DBLP2 DBLP3 DBLP_universal \
   --output-root results/dblp_lp
+python -m experiments.link_prediction.benchmark_dblp \
+  --config configs/dblp_lp_invariant.yaml \
+  --variants DBLP_invariant_v1 DBLP_invariant_v2 DBLP_invariant_v3 \
+  --output-root results/dblp_lp_invariant
 ```
 
 Keep every matched invariance run on the same GPU architecture (for example,
@@ -265,7 +284,7 @@ arm with:
 
 ```bash
 python -m analysis.kendall_tau_dblp_lp \
-  --root results/dblp_lp \
+  --root results/dblp_lp_invariant \
   --output reports/kendall_tau_dblp_lp_invariant.csv
 ```
 

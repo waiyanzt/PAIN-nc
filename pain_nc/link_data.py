@@ -12,7 +12,7 @@ from .data import PATH_FIELDS, _torch_load, group_paths_by_root, reverse_valid_p
 
 @dataclass
 class PainLinkGraph:
-    """One physical graph variant and its exact rooted-path program."""
+    """One physical or conditional graph input and its rooted-path program."""
 
     node_type: torch.Tensor
     edge_index: torch.Tensor

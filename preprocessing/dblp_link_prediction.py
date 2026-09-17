@@ -349,33 +349,34 @@ def build_variant_edges(
 
 
 def compile_invariant_edges(
-    contract: Contract,
     physical: dict[str, set[tuple[int, int]]],
     variant: str,
+    *,
+    paper_area_certificate: dict[int, int],
 ) -> tuple[dict[str, set[tuple[int, int]]], dict[str, int | str]]:
-    """Compile one physical realization into the common semantic edge program.
+    """Compile conditional propagation edges from one physical realization.
 
-    Area-bearing intermediate nodes are context only. They license the same
-    Paper-Area, Conference-Area, and Author-Area propagation edges regardless
-    of whether the physical evidence occurs on a paper, conference, or author.
+    The training-block Paper-Area certificate disambiguates shared conference
+    and author contexts. It is context-only, never a PAIN model input. Every
+    emitted edge also requires a witness in this variant's physical graph.
     """
+    context_relation = {
+        "v1": "paper-area",
+        "v2": "conference-area",
+        "v3": "author-area",
+    }.get(variant)
+    if context_relation is None:
+        raise ValueError(f"Invariant compilation requires v1-v3, got {variant}")
+    for relation in ("paper-area", "conference-area", "author-area"):
+        if relation != context_relation and physical.get(relation):
+            raise RuntimeError(
+                f"{variant}: unexpected {relation} physical edges; expected "
+                f"only {context_relation} Area placement"
+            )
     semantic = {
         relation: set(physical.get(relation, set()))
         for relation in ("author-paper", "paper-term", "paper-conference")
     }
-    maps = contract.maps
-    train_papers = set(contract.raw_split_papers["train"].tolist())
-    paper_area = dict(
-        contract.paper_area[["paper_id", "area_id"]].itertuples(index=False)
-    )
-    authors_by_paper = (
-        contract.paper_author.groupby("paper_id")["author_id"].apply(list).to_dict()
-    )
-    confs_by_paper = (
-        contract.paper_conf[
-            contract.paper_conf["paper_id"].isin(train_papers)
-        ].groupby("paper_id")["conf_id"].apply(list).to_dict()
-    )
     physical_adj: dict[str, dict[int, set[int]]] = {}
     for relation, rows in physical.items():
         adjacency: dict[int, set[int]] = {}
@@ -386,21 +387,16 @@ def compile_invariant_edges(
     ambiguous = 0
     rejected = 0
     matched = 0
-    for raw_paper in sorted(train_papers & set(paper_area)):
-        paper = maps["paper"].get(int(raw_paper))
-        area = maps["area"].get(int(paper_area[raw_paper]))
-        if paper is None or area is None:
-            continue
-        authors = [
-            maps["author"][int(author)]
-            for author in authors_by_paper.get(raw_paper, ())
-            if int(author) in maps["author"]
-        ]
-        conferences = [
-            maps["conference"][int(conf)]
-            for conf in confs_by_paper.get(raw_paper, ())
-            if int(conf) in maps["conference"]
-        ]
+    for paper, area in sorted(paper_area_certificate.items()):
+        authors = sorted(physical_adj.get("author-paper", {}).get(paper, set()))
+        conferences = sorted(
+            physical_adj.get("paper-conference", {}).get(paper, set())
+        )
+        if not authors or not conferences:
+            raise RuntimeError(
+                f"{variant}: training block paper={paper} lacks physical "
+                "Author-Paper or Paper-Conference context"
+            )
         if variant == "v1":
             candidates = physical_adj.get("paper-area", {}).get(paper, set())
         elif variant == "v2":
@@ -415,8 +411,6 @@ def compile_invariant_edges(
                 candidates.update(
                     physical_adj.get("author-area", {}).get(author, set())
                 )
-        else:
-            raise ValueError(f"Invariant compilation requires v1-v3, got {variant}")
         if len(candidates) > 1:
             ambiguous += 1
         rejected += len(candidates - {area})
@@ -424,6 +418,22 @@ def compile_invariant_edges(
             raise RuntimeError(
                 f"{variant}: physical context does not license paper={paper}, area={area}; "
                 f"candidates={sorted(candidates)}"
+            )
+        if variant == "v2" and any(
+            area not in physical_adj.get("conference-area", {}).get(conf, set())
+            for conf in conferences
+        ):
+            raise RuntimeError(
+                f"{variant}: not every Paper-Conference witness supports "
+                f"paper={paper}, area={area}"
+            )
+        if variant == "v3" and any(
+            area not in physical_adj.get("author-area", {}).get(author, set())
+            for author in authors
+        ):
+            raise RuntimeError(
+                f"{variant}: not every Paper-Author witness supports "
+                f"paper={paper}, area={area}"
             )
         matched += 1
         add_edge(semantic, "paper-area", paper, area)
@@ -438,8 +448,34 @@ def compile_invariant_edges(
         "ambiguous_raw_contexts": ambiguous,
         "raw_candidates_rejected_by_pair_filter": rejected,
         "pair_filter_model_input": 0,
+        "certificate_scope": "training_paper_conference_blocks_only",
     }
     return semantic, audit
+
+
+def training_paper_area_certificate(contract: Contract) -> dict[int, int]:
+    """Identify the Area of each eligible training transformation block.
+
+    This side information comes from author labels, not from the tested
+    physical graph. Its use is explicit so the experimental contract can be
+    audited independently of the PAIN propagation input.
+    """
+    train_papers = set(contract.raw_split_papers["train"].tolist())
+    certificate: dict[int, int] = {}
+    for raw_paper, raw_area in contract.paper_area[
+        ["paper_id", "area_id"]
+    ].itertuples(index=False):
+        if int(raw_paper) in train_papers:
+            certificate[contract.maps["paper"][int(raw_paper)]] = (
+                contract.maps["area"][int(raw_area)]
+            )
+    expected = train_papers & set(contract.maps["paper"])
+    if not certificate or len(certificate) != len(expected):
+        raise RuntimeError(
+            "Training Paper-Area certificate is empty or incomplete: "
+            f"found={len(certificate)}, expected={len(expected)}"
+        )
+    return certificate
 
 
 def graph_tensors(
@@ -953,7 +989,7 @@ def preprocess(
         *,
         mapping_mode: str,
         extra_meta: dict | None = None,
-    ) -> None:
+    ) -> dict:
         edge_index, edge_type, adjacency, edge_lookup = graph_tensors(
             relation_edges, int(contract.node_type.numel())
         )
@@ -1016,7 +1052,7 @@ def preprocess(
             flush=True,
         )
         if count_only:
-            return
+            return details
         paths = enumerate_pain_paths(
             adjacency,
             edge_lookup,
@@ -1043,6 +1079,7 @@ def preprocess(
         }
         atomic_torch_save(payload, output_dir / f"{name}_{artifact_tag}.pt")
         del paths, payload, edge_index, edge_type, adjacency, edge_lookup
+        return details
 
     if mode in {"baseline", "both"}:
         for variant in variants_to_build:
@@ -1066,6 +1103,13 @@ def preprocess(
         # three physical realizations so each can compile the same semantic
         # program without held-out paper-conference topology.
         invariant_sources = build_variant_edges(contract, area_scope="train")
+        certificate = training_paper_area_certificate(contract)
+        certificate_rows = np.asarray(
+            sorted(certificate.items()), dtype=np.int64
+        ).reshape(-1, 2)
+        certificate_sha256 = hashlib.sha256(
+            certificate_rows.tobytes()
+        ).hexdigest()
         compiled: dict[str, dict[str, set[tuple[int, int]]]] = {}
         compiler_audits = {}
         physical_hashes = {}
@@ -1076,7 +1120,9 @@ def preprocess(
             )
             physical_hashes[variant] = tensor_hash(physical_tensors[:2])
             semantic, audit = compile_invariant_edges(
-                contract, invariant_sources[variant], variant
+                invariant_sources[variant],
+                variant,
+                paper_area_certificate=certificate,
             )
             semantic_tensors = graph_tensors(
                 semantic, int(contract.node_type.numel())
@@ -1101,20 +1147,49 @@ def preprocess(
             "physical_graphs_different": True,
             "semantic_programs_equal": True,
             "compiler_audits": compiler_audits,
+            "certificate_sha256": certificate_sha256,
+            "certificate_records": len(certificate),
+            "certificate_source": "author_labels_for_training_paper_blocks",
+            "closure_matches_train_scope_union": True,
         }
-        process_program(
-            "invariant",
-            first_semantic,
-            mapping_mode="compiled_invariant_semantic_paths",
-            extra_meta={
-                "physical_graph_hashes": physical_hashes,
-                "semantic_program_hashes": semantic_hashes,
-                "compiler_audits": compiler_audits,
-                "semantic_programs_equal": True,
-                "physical_graphs_different": True,
-                "area_context_scope": "training_transformation_blocks",
-            },
-        )
+        invariant_details = {}
+        for variant in VARIANTS[:-1]:
+            name = f"invariant_{variant}"
+            invariant_details[variant] = process_program(
+                name,
+                compiled[variant],
+                mapping_mode="context_licensed_train_scope_union_paths",
+                extra_meta={
+                    "physical_source_variant": variant,
+                    "physical_graph_sha256": physical_hashes[variant],
+                    "physical_graph_hashes": physical_hashes,
+                    "semantic_program_hashes": semantic_hashes,
+                    "compiler_audits": compiler_audits,
+                    "certificate_sha256": certificate_sha256,
+                    "certificate_records": len(certificate),
+                    "semantic_programs_equal": True,
+                    "physical_graphs_different": True,
+                    "area_context_scope": "training_transformation_blocks",
+                    "conditional_path_rule": (
+                        "each projected relation requires a physical context "
+                        "witness; paths are enumerated after projection"
+                    ),
+                },
+            )
+        if not count_only:
+            for field in (
+                "message_program_sha256",
+                "selected_path_program_sha256",
+                "selected_path_weights_sha256",
+            ):
+                values = {invariant_details[v].get(field) for v in VARIANTS[:-1]}
+                if len(values) != 1:
+                    raise RuntimeError(
+                        f"Invariant PAIN input audit failed: {field} differs "
+                        "across independently materialized variants"
+                    )
+            summary["invariance_audit"]["selected_paths_equal"] = True
+            summary["invariance_audit"]["path_weights_equal"] = True
     atomic_write_json(summary, output_dir / "metadata.json")
     if count_only:
         print("Count-only mode: no tensor artifacts were written.")
