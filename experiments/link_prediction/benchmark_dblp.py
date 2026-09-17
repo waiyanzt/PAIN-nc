@@ -23,12 +23,11 @@ VARIANTS = {
     "DBLP2": "v2",
     "DBLP3": "v3",
     "DBLP_universal": "universal",
-    # The three entries deliberately load the same deduplicated semantic-path
-    # artifact. Preprocessing independently compiles it from each distinct
-    # physical graph and refuses to save unless all semantic hashes match.
-    "DBLP_invariant_v1": "invariant",
-    "DBLP_invariant_v2": "invariant",
-    "DBLP_invariant_v3": "invariant",
+    # Each invariant arm has its own path artifact, constructed from its own
+    # physical graph. Preprocessing audits equality of the model-facing paths.
+    "DBLP_invariant_v1": "invariant_v1",
+    "DBLP_invariant_v2": "invariant_v2",
+    "DBLP_invariant_v3": "invariant_v3",
 }
 METRICS = (
     "best_val_mrr",
@@ -73,6 +72,11 @@ def preflight(config: dict[str, Any], variants: list[str]) -> None:
         metadata_path,
         *(data_dir / f"{VARIANTS[v]}_{artifact_tag}.pt" for v in variants),
     ]
+    if any(name.startswith("DBLP_invariant_") for name in variants):
+        required.extend(
+            data_dir / f"invariant_{source}_{artifact_tag}.pt"
+            for source in ("v1", "v2", "v3")
+        )
     missing = [path for path in required if not path.is_file()]
     if missing:
         formatted = "\n".join(f"  - {path}" for path in missing)
@@ -88,12 +92,27 @@ def preflight(config: dict[str, Any], variants: list[str]) -> None:
         )
     if any(name.startswith("DBLP_invariant_") for name in variants):
         audit = metadata.get("invariance_audit", {})
-        if not audit.get("physical_graphs_different") or not audit.get(
-            "semantic_programs_equal"
+        if (
+            not audit.get("physical_graphs_different")
+            or not audit.get("semantic_programs_equal")
+            or not audit.get("selected_paths_equal")
+            or not audit.get("path_weights_equal")
         ):
             raise ValueError(
-                "Invariant DBLP artifacts lack a passing physical/semantic hash audit"
+                "Invariant DBLP artifacts lack a passing physical, semantic, "
+                "and independently materialized PAIN-path audit"
             )
+        invariant_details = [
+            metadata["variants"][f"invariant_{source}"]
+            for source in ("v1", "v2", "v3")
+        ]
+        for field in (
+            "message_program_sha256",
+            "selected_path_program_sha256",
+            "selected_path_weights_sha256",
+        ):
+            if len({details.get(field) for details in invariant_details}) != 1:
+                raise ValueError(f"Invariant DBLP artifacts disagree on {field}")
     print(f"Shared: {shared} ({shared.stat().st_size / 2**20:.1f} MiB)")
     for display_name in variants:
         source_name = VARIANTS[display_name]
@@ -197,6 +216,7 @@ def main() -> None:
 
     data_dir = Path(config["data"]["preprocessed_dir"])
     artifact_tag = str(config["data"].get("artifact_tag", "L3"))
+    metadata = json.loads((data_dir / "metadata.json").read_text(encoding="utf-8"))
     output_root = Path(args.output_root)
     rows = []
     for variant in args.variants:
@@ -206,6 +226,24 @@ def main() -> None:
             if destination.exists() and not args.overwrite:
                 print(f"Loading existing {destination}")
                 artifact = torch.load(destination, map_location="cpu", weights_only=False)
+                if variant.startswith("DBLP_invariant_"):
+                    expected = metadata["variants"][VARIANTS[variant]]
+                    if artifact.get("variant_source_name") != VARIANTS[variant]:
+                        raise RuntimeError(
+                            f"Existing invariant run {destination} was trained "
+                            "from an older or different path artifact. Use a "
+                            "fresh output root for the new invariant protocol."
+                        )
+                    for field in (
+                        "message_program_sha256",
+                        "selected_path_program_sha256",
+                        "selected_path_weights_sha256",
+                    ):
+                        if artifact.get(field) != expected.get(field):
+                            raise RuntimeError(
+                                f"Existing invariant run {destination} has "
+                                f"different {field}; do not reuse it."
+                            )
                 try:
                     validate_resource_metrics(artifact.get("resources", {}))
                 except ValueError as error:
