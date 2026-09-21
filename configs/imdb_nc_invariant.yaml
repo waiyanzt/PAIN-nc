@@ -1,0 +1,39 @@
+# Same PAIN architecture and training protocol as imdb_nc.yaml.  Only the
+# artifact directory changes: every source variant is independently compiled
+# to the same conditional semantic path program.
+device: cuda:0
+
+data:
+  preprocessed_dir: data/preprocessed/IMDB_invariant
+  shared_path: data/preprocessed/IMDB_invariant/shared.pt
+
+model:
+  hidden_dim: 128
+  num_layers: 5
+  lstm_depth: 2
+  head_layers: 2
+  path_length: 3
+  dropout: 0.0
+  share_lstm: true
+  reverse_paths: true
+  mark_neighbors: true
+  shortest_path_encoding: false
+  path_aggregation: sum
+  jumping_knowledge: last
+  use_node_types: true
+  path_chunk_size: 100000
+  checkpoint_chunks: true
+  paths_on_device: true
+
+training:
+  selection_metric: macro_f1
+  epochs: 1000
+  learning_rate: 0.001
+  weight_decay: 0.0
+  lr_factor: 0.5
+  lr_patience: 20
+  min_learning_rate: 0.00001
+  early_stopping_patience: 80
+  gradient_clip_norm: 5.0
+  max_hours: 12
+  deterministic: true

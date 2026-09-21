@@ -177,6 +177,59 @@ Resume an interrupted run with the same configuration and output root by adding
 `--resume`. The default augmentation budget is update-matched: 250 super-epochs
 times four variants equals the 1,000-update cap of an independent baseline.
 
+## Invariant IMDb1-4 PAIN
+
+The invariant arm follows the four-variant switching contract in
+`INV-RGCN-guide`. Each genuinely different physical graph independently
+matches its Movie-Link contexts, projects the licensed Movie/Link-to-Director
+and Movie/Link-to-Actor semantic edges, and only then enumerates every exact
+PAIN path of length zero through three. Preprocessing fails unless all four
+physical graph hashes differ and all four semantic graph and PAIN path hashes
+match.
+
+IMDb4 uses the paper-compatible topology: Movie-Link, Link-Director, and the
+complete Movie-Actor relation (Actor1, Actor2, and Actor3). Older artifacts
+that omitted Actor1 are not valid inputs to this arm.
+
+Build and validate four independently compiled artifacts:
+
+```bash
+python -m preprocessing.imdb_invariant \
+  --output-dir data/preprocessed/IMDB_invariant
+
+python -m experiments.node_classification.benchmark_imdb \
+  --config configs/imdb_nc_invariant.yaml \
+  --variants IMDb_invariant_v1 IMDb_invariant_v2 \
+             IMDb_invariant_v3 IMDb_invariant_v4 \
+  --preflight-only
+```
+
+Run every source variant over the three standard seeds:
+
+```bash
+python -m experiments.node_classification.benchmark_imdb \
+  --config configs/imdb_nc_invariant.yaml \
+  --variants IMDb_invariant_v1 IMDb_invariant_v2 \
+             IMDb_invariant_v3 IMDb_invariant_v4 \
+  --output-root results/imdb_nc_invariant
+```
+
+All four matched-seed runs must use one GPU architecture. Audit the source
+graphs, compiled path programs, probabilities, checkpoints, and Kendall tau:
+
+```bash
+python -m analysis.validate_imdb_invariant \
+  --metadata data/preprocessed/IMDB_invariant/metadata.json \
+  --root results/imdb_nc_invariant \
+  --output reports/imdb_nc_invariant_audit.csv
+```
+
+The compiled semantic closure equals the physical four-variant universal
+graph. The experimental claim is stronger than simply training on that union:
+each invariant artifact is derived from one physical variant, retains its raw
+physical tensors for provenance, and must independently pass the same
+semantic/path hash checks.
+
 ## Kendall tau
 
 After all matched seed artifacts exist, compare per-node class-score rankings:
@@ -309,6 +362,7 @@ Add `--resume` after a time-limited interruption.
 preprocessing/                 raw IMDb/DBLP -> shared and L=3 path tensors
 pain_nc/                       PAIN node-classification and link models
 configs/imdb_nc.yaml           faithful default experiment configuration
+configs/imdb_nc_invariant.yaml invariant IMDb1-4 input contract
 experiments/node_classification/
                                training and multi-variant benchmark
 experiments/link_prediction/   DBLP training and seven-arm benchmark

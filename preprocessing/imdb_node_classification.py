@@ -274,16 +274,191 @@ def base_variant_edges(
         variants["v3"].add(canonical_edge(movie, link))
         variants["v3"].update(canonical_edge(link, actor) for actor in actors)
 
-        # v4 intentionally mirrors dhn_nclp: Actor1 is omitted, Actor2/3 stay
-        # direct, and the director is rerouted through link.
+        # v4: every actor remains direct and the director is rerouted through
+        # the Link node.  Keeping Actor1 is required by the four-variant IMDb
+        # switching contract used by INV-RGCN-guide and the paper: v4 differs
+        # from v2 only in which side of M-L carries the Actor relation.
         variants["v4"].add(canonical_edge(movie, link))
         variants["v4"].add(canonical_edge(link, director))
         variants["v4"].update(
-            canonical_edge(movie, actor) for actor in actors[1:]
+            canonical_edge(movie, actor) for actor in actors
         )
 
     variants["universal"] = set().union(*variants.values())
     return variants
+
+
+def compile_invariant_edges(
+    physical_edges: set[tuple[int, int]],
+    variant: str,
+    node_types: np.ndarray,
+) -> tuple[set[tuple[int, int]], dict[str, int | str]]:
+    """Compile one physical IMDb realization to the shared semantic graph.
+
+    IMDb1-4 move Director and Actor attachments between a Movie and its
+    one-to-one Link node.  M-L-X or L-M-X is therefore a context occurrence;
+    the Link/Movie bridge licenses the corresponding semantic M-X or L-X
+    propagation edge while the bridge node is excluded from that edge.
+
+    This is the preprocessing-time PAIN analogue of the guide's conditional
+    IMDb RGCN projection.  Every emitted virtual edge requires a witness in
+    this variant's physical graph.  Cross-variant equality is checked by the
+    invariant preprocessor before any experiment is allowed to run.
+    """
+    expected_families = {
+        "v1": {"movie-link", "movie-director", "movie-actor"},
+        "v2": {"movie-link", "link-director", "link-actor"},
+        "v3": {"movie-link", "movie-director", "link-actor"},
+        "v4": {"movie-link", "link-director", "movie-actor"},
+    }
+    if variant not in expected_families:
+        raise ValueError(
+            f"Invariant IMDb compilation requires v1-v4, got {variant!r}"
+        )
+
+    families: dict[str, set[tuple[int, int]]] = {
+        name: set()
+        for name in (
+            "movie-link",
+            "movie-director",
+            "movie-actor",
+            "link-director",
+            "link-actor",
+        )
+    }
+    type_pair_to_family = {
+        (0, 1): ("movie-director", 0),
+        (0, 2): ("movie-actor", 0),
+        (0, 3): ("movie-link", 0),
+        (1, 3): ("link-director", 3),
+        (2, 3): ("link-actor", 3),
+    }
+    for left, right in sorted(physical_edges):
+        left_type = int(node_types[left])
+        right_type = int(node_types[right])
+        pair = tuple(sorted((left_type, right_type)))
+        family_spec = type_pair_to_family.get(pair)
+        if family_spec is None:
+            raise RuntimeError(
+                f"{variant}: unsupported physical endpoint types {pair}"
+            )
+        family, source_type = family_spec
+        # Store every family in its semantic orientation.
+        if left_type == source_type:
+            families[family].add((int(left), int(right)))
+        else:
+            families[family].add((int(right), int(left)))
+
+    present = {name for name, rows in families.items() if rows}
+    unexpected = present - expected_families[variant]
+    missing = expected_families[variant] - present
+    if unexpected or missing:
+        raise RuntimeError(
+            f"{variant}: physical relation-family mismatch; "
+            f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+        )
+
+    movie_to_link: dict[int, set[int]] = {}
+    link_to_movie: dict[int, set[int]] = {}
+    for movie, link in families["movie-link"]:
+        movie_to_link.setdefault(movie, set()).add(link)
+        link_to_movie.setdefault(link, set()).add(movie)
+    bad_movies = {
+        movie: links for movie, links in movie_to_link.items() if len(links) != 1
+    }
+    bad_links = {
+        link: movies for link, movies in link_to_movie.items() if len(movies) != 1
+    }
+    if bad_movies or bad_links:
+        raise RuntimeError(
+            f"{variant}: Movie-Link must be one-to-one; "
+            f"bad_movies={bad_movies}, bad_links={bad_links}"
+        )
+    expected_movies = {
+        int(node) for node in np.flatnonzero(node_types == 0)
+    }
+    expected_links = {
+        int(node) for node in np.flatnonzero(node_types == 3)
+    }
+    if set(movie_to_link) != expected_movies or set(link_to_movie) != expected_links:
+        raise RuntimeError(
+            f"{variant}: Movie-Link contexts do not cover the complete contract; "
+            f"movies={len(movie_to_link)}/{len(expected_movies)}, "
+            f"links={len(link_to_movie)}/{len(expected_links)}"
+        )
+
+    def group(rows: set[tuple[int, int]]) -> dict[int, set[int]]:
+        grouped: dict[int, set[int]] = {}
+        for source, target in rows:
+            grouped.setdefault(source, set()).add(target)
+        return grouped
+
+    movie_directors = group(families["movie-director"])
+    movie_actors = group(families["movie-actor"])
+    link_directors = group(families["link-director"])
+    link_actors = group(families["link-actor"])
+    director_source = movie_directors if variant in {"v1", "v3"} else link_directors
+    actor_source = movie_actors if variant in {"v1", "v4"} else link_actors
+
+    semantic: set[tuple[int, int]] = set()
+    direct_edges = 0
+    virtual_edges = 0
+    director_contexts = 0
+    actor_contexts = 0
+    for movie in sorted(movie_to_link):
+        link = next(iter(movie_to_link[movie]))
+        director_key = movie if variant in {"v1", "v3"} else link
+        actor_key = movie if variant in {"v1", "v4"} else link
+        directors = director_source.get(director_key, set())
+        actors = actor_source.get(actor_key, set())
+        if len(directors) != 1:
+            raise RuntimeError(
+                f"{variant}: context block movie={movie}, link={link} has "
+                f"{len(directors)} Director witnesses; expected exactly one"
+            )
+        if not actors:
+            raise RuntimeError(
+                f"{variant}: context block movie={movie}, link={link} has no "
+                "Actor witness"
+            )
+
+        semantic.add(canonical_edge(movie, link))
+        for director in directors:
+            director_contexts += 1
+            for edge in (
+                canonical_edge(movie, director),
+                canonical_edge(link, director),
+            ):
+                semantic.add(edge)
+                if edge in physical_edges:
+                    direct_edges += 1
+                else:
+                    virtual_edges += 1
+        for actor in sorted(actors):
+            actor_contexts += 1
+            for edge in (
+                canonical_edge(movie, actor),
+                canonical_edge(link, actor),
+            ):
+                semantic.add(edge)
+                if edge in physical_edges:
+                    direct_edges += 1
+                else:
+                    virtual_edges += 1
+
+    # Every M-L edge is a direct semantic edge. Counts above cover D/A edges.
+    direct_edges += len(families["movie-link"])
+    audit: dict[str, int | str] = {
+        "variant": variant,
+        "compiler": "imdb_movie_link_conditional_semantic_closure",
+        "movie_link_contexts": len(families["movie-link"]),
+        "director_contexts": director_contexts,
+        "actor_contexts": actor_contexts,
+        "direct_semantic_edges": direct_edges,
+        "virtual_semantic_edges": virtual_edges,
+        "semantic_edges": len(semantic),
+    }
+    return semantic, audit
 
 
 def edge_type_id(

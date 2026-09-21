@@ -280,6 +280,19 @@ def train_one_run(
         "elapsed_seconds": elapsed,
         "num_nodes": graph.num_nodes,
         "num_paths": graph.num_paths,
+        "mapping_mode": graph.variant_meta.get("mapping_mode"),
+        "physical_graph_sha256": graph.variant_meta.get(
+            "physical_graph_sha256"
+        ),
+        "semantic_graph_sha256": graph.variant_meta.get(
+            "semantic_graph_sha256"
+        ),
+        "selected_path_program_sha256": graph.variant_meta.get(
+            "selected_path_program_sha256"
+        ),
+        "shared_contract_sha256": graph.variant_meta.get(
+            "shared_contract_sha256"
+        ),
         "history": history,
         "config": copy.deepcopy(config),
         "model_state_dict": best_state,
