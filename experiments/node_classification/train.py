@@ -63,6 +63,7 @@ def build_model(graph: PainGraph, config: dict[str, Any]) -> PainNodeClassifier:
         num_classes=graph.num_classes,
         num_node_types=graph.num_node_types,
         num_edge_types=graph.num_edge_types,
+        num_nodes=graph.num_nodes,
         **model_config,
     )
 
@@ -265,7 +266,7 @@ def train_one_run(
     }
     validate_resource_metrics(resources)
     return {
-        "dataset": "IMDB",
+        "dataset": graph.shared_meta.get("dataset", "unknown"),
         "model": "PAIN-NC",
         "variant": variant,
         "variant_source_name": graph.variant_meta.get("variant"),

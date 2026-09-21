@@ -1,574 +1,810 @@
 #!/usr/bin/env python3
-"""Emit LaTeX table rows (results / invariance / scalability) for every dataset x model x method.
+"""Build PAIN-only, Overleaf-ready tables from per-run result artifacts.
 
-    python paper_tables/build_paper_tables.py            # writes paper_tables/<Dataset>.tex + README.md
+The script deliberately reads the individual run artifacts instead of trusting
+top-level aggregate CSV files, because those files are rewritten when a subset
+of variants or seeds is launched. Missing runs remain visibly partial in the
+tables and are listed in ``PAIN_COMPLETENESS.md``.
 
-Every number is recomputed from the raw per-run outputs (test logits / candidate scores) with ONE
-definition per metric, so the models are comparable; only the resource columns (time, epochs,
-parameters, GPU peaks) are taken from the runs' own records. See README.md for definitions and
-for the exact result root behind every block.  Conventions:
+Run from the repository root:
 
-* mean $\\pm$ population std (ddof=0) over the three seeds, 4 decimals (scalability: 2 decimals, zero-padded).
-* within a block, every data row after the first is prefixed with '& & ' (empty model / method cells).
-* NC results: accuracy, macro precision, macro recall, micro-F1, macro-F1 (test nodes).
-* LP results: precision, recall, F1 (sigmoid(score) >= .5 over every candidate: positive=1, sampled
-  negatives=0), Hits@1, Hits@3, MRR (averaged-rank tie convention); WN18RR Hits/MRR are the
-  filtered full-entity ranks stored by the runs.
-* invariance: per seed, for every variant pair, the mean over test nodes/queries of Kendall tau-b
-  between the two score rows (1 when identical); LP adds tau over the per-query Hit@1 / Hit@3
-  indicator vectors. Augmentation = the same pairwise statistic on the shared model's per-variant
-  outputs. The canonical (union-graph) arm is a single model, so it is skipped.
-* scalability: train time (s), epochs (augmentation: variant-epochs), parameters (MiB), peak
-  training GPU (MiB), peak inference GPU (MiB).
+    python build_paper_tables.py
+
+PyTorch, NumPy, and SciPy are required. No training data are loaded and no
+model is instantiated; the script only reads completed result artifacts.
 """
 from __future__ import annotations
 
+import argparse
 import csv
-import glob
 import itertools
 import json
 import math
-import os
-import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Iterable
 
 import numpy as np
 from scipy.stats import kendalltau
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
-ROOT = Path(__file__).resolve().parent.parent
-B = ROOT / "src" / "baselines"
-DATA = Path("/nfs/hpc/share/mousavij/gnn/data/preprocessed")
-OUT = ROOT / "paper_tables"
-SEEDS = (1566911444, 20241017, 20251017)
-MIB = 1024.0 ** 2
 
-VARIANT_LABEL = {
+REPO = Path(__file__).resolve().parent
+DEFAULT_SEEDS = (1566911444, 20241017, 20251017)
+MIB = 1024.0**2
+
+IMDB_VARIANTS = ("v1", "v2", "v3", "v4")
+DBLP_VARIANTS = ("v1", "v2", "v3")
+DISPLAY = {
     "IMDB": {"v1": "IMDb1", "v2": "IMDb2", "v3": "IMDb3", "v4": "IMDb4"},
     "DBLP": {"v1": "DBLP1", "v2": "DBLP2", "v3": "DBLP3"},
-    "WORDNET": {"no_changes": "WN18RR1", "all_inverse_edges": "WN18RR2", "transitive_edges": "WN18RR3"},
-    "FREEBASE": {"unchanged": "Freebase1", "exact_2": "Freebase2", "exact_3": "Freebase3"},
 }
-UNION_LABEL = {"IMDB": r"\multirow{2}{*}{$\bigcup_i \text{IMDb}_i$}", "DBLP": r"\multirow{2}{*}{$\bigcup_i \text{DBLP}_i$}",
-               "WORDNET": r"\multirow{2}{*}{$\bigcup_i \text{WN18RR}_i$}", "FREEBASE": r"\multirow{2}{*}{$\bigcup_i \text{Freebase}_i$}"}
-NC_COLS = ["accuracy", "precision", "recall", "micro_f1", "macro_f1"]
-LP_COLS = ["precision", "recall", "f1", "hits@1", "hits@3", "mrr"]
-NC_INV = ["tau"]
-LP_INV = ["tau", "tau@1", "tau@3"]
-SCAL = ["train_time_sec", "epochs", "parameter_mib", "peak_training_gpu_mib", "peak_inference_gpu_mib"]
+
+NC_METRICS = (
+    ("accuracy", "Accuracy"),
+    ("precision_macro", "Macro precision"),
+    ("recall_macro", "Macro recall"),
+    ("f1_micro", "Micro-F1"),
+    ("f1_macro", "Macro-F1"),
+)
+LP_METRICS = (
+    ("precision", "Precision"),
+    ("recall", "Recall"),
+    ("f1", "F1"),
+    ("hits_at_1", "Hits@1"),
+    ("hits_at_3", "Hits@3"),
+    ("mrr", "MRR"),
+)
+SCALABILITY_METRICS = (
+    ("training_time_sec", "Train time (s)"),
+    ("epochs", "Epochs / updates"),
+    ("parameter_mib", "Parameters (MiB)"),
+    ("peak_training_gpu_mib", "Peak train GPU (MiB)"),
+    ("peak_inference_gpu_mib", "Peak inference GPU (MiB)"),
+)
 
 
-# ----------------------------------------------------------------------------- records
 @dataclass
 class Run:
+    dataset: str
+    task: str
+    method: str
     variant: str
     seed: int
-    task_type: str                      # "nc" | "lp"
-    scores: np.ndarray                  # nc: [n, C] logits; lp: [q, K+1] candidate scores
-    labels: np.ndarray | None = None    # nc: [n]
-    pos_col: np.ndarray | None = None   # lp: positive column per query (default 0)
-    ranks: np.ndarray | None = None     # lp: precomputed 1-based ranks (WN18RR filtered)
-    row_ids: np.ndarray | None = None   # alignment key across variants (nc node ids / lp query ids)
-    resources: dict = field(default_factory=dict)
-    stored: dict = field(default_factory=dict)
+    metrics: dict[str, float]
+    resources: dict[str, float]
+    source: Path
+    scores: np.ndarray | None = None
+    row_ids: np.ndarray | None = None
+    candidate_ids: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class RowSpec:
+    method: str
+    variant: str
+    label: str
 
 
 @dataclass
-class Block:
-    dataset: str; task: str; model: str; method: str; title: str; runs: list; note: str = ""; sources: list = field(default_factory=list)
+class ExpectedRun:
+    dataset: str
+    task: str
+    method: str
+    variant: str
+    seed: int
+    source: Path
+    state: str
+    detail: str = ""
 
 
-def std(x): return float(np.std(np.asarray(x, dtype=float), ddof=0))
-def fmt(vals, nd=4):
-    """mean $\\pm$ std with exactly `nd` decimals (zero-padded): 4 for results/invariance, 2 for scalability."""
-    vals = [v for v in vals if v is not None and not (isinstance(v, float) and math.isnan(v))]
-    if not vals: return "--"
-    return f"{np.mean(vals):.{nd}f} $\\pm$ {std(vals):.{nd}f}"
-SCAL_DECIMALS = 2
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS))
+    parser.add_argument("--output-dir", type=Path, default=Path("paper_tables/pain"))
+    parser.add_argument("--imdb-original-root", type=Path, default=Path("results/imdb_nc"))
+    parser.add_argument("--imdb-v4-root", type=Path, default=Path("results/imdb_nc_v4_fixed"))
+    parser.add_argument("--imdb-universal-root", type=Path, default=Path("results/imdb_nc_universal"))
+    parser.add_argument("--imdb-augmentation-root", type=Path, default=Path("results/imdb_nc_augmentation_v4_fixed"))
+    parser.add_argument("--imdb-invariant-root", type=Path, default=Path("results/imdb_nc_invariant"))
+    parser.add_argument("--dblp-original-root", type=Path, default=Path("results/dblp_lp"))
+    parser.add_argument("--dblp-augmentation-root", type=Path, default=Path("results/dblp_lp_augmentation"))
+    parser.add_argument("--dblp-invariant-root", type=Path, default=Path("results/dblp_lp_invariant"))
+    return parser.parse_args()
 
 
-def continue_rows(lines):
-    """Prefix every data row after the first one in a block with '& & ' (the model / method cells are
-    left empty on continuation rows). Comment lines are passed through and do not count."""
-    out, seen = [], False
-    for ln in lines:
-        if ln.startswith("%") or not ln.strip():
-            out.append(ln)
-        else:
-            out.append(("& & " + ln) if seen else ln); seen = True
-    return out
+def absolute(path: Path) -> Path:
+    return path if path.is_absolute() else REPO / path
 
 
-# ----------------------------------------------------------------------------- metrics
-def nc_metrics(r: Run) -> dict:
-    pred = r.scores.argmax(1); y = r.labels
-    return {"accuracy": accuracy_score(y, pred), "precision": precision_score(y, pred, average="macro", zero_division=0),
-            "recall": recall_score(y, pred, average="macro", zero_division=0), "micro_f1": f1_score(y, pred, average="micro"),
-            "macro_f1": f1_score(y, pred, average="macro")}
+def as_numpy(value: Any) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        return value.numpy()
+    return np.asarray(value)
 
 
-def lp_ranks(r: Run) -> np.ndarray:
-    if r.ranks is not None: return r.ranks.astype(float)
-    S = r.scores; pc = r.pos_col if r.pos_col is not None else np.zeros(len(S), dtype=int)
-    pos = S[np.arange(len(S)), pc]
-    better = (S > pos[:, None]).sum(1); tied = (S == pos[:, None]).sum(1) - 1
-    return 1.0 + better + tied / 2.0
+def load_pt(path: Path) -> dict[str, Any]:
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(
+            "PyTorch is required to read the saved .pt result artifacts. "
+            "Run this script in the same environment used for PAIN."
+        ) from exc
+    return torch.load(path, map_location="cpu", weights_only=False)
 
 
-def lp_metrics(r: Run) -> dict:
-    S = r.scores; pc = r.pos_col if r.pos_col is not None else np.zeros(len(S), dtype=int)
-    lab = np.zeros_like(S, dtype=int); lab[np.arange(len(S)), pc] = 1
-    prob = 1.0 / (1.0 + np.exp(-S.astype(np.float64))); pred = (prob >= 0.5).astype(int)
-    y = lab.ravel(); p = pred.ravel()
-    ranks = lp_ranks(r)
-    out = {"precision": precision_score(y, p, zero_division=0), "recall": recall_score(y, p, zero_division=0), "f1": f1_score(y, p, zero_division=0),
-           "hits@1": float(np.mean(ranks <= 1)), "hits@3": float(np.mean(ranks <= 3)), "mrr": float(np.mean(1.0 / ranks))}
-    for k, v in r.stored.items():                                   # explicit overrides (WN18RR filtered protocol)
-        out[k] = v
-    return out
+def scalar(value: Any) -> float:
+    if hasattr(value, "item"):
+        value = value.item()
+    return float(value)
 
 
-def row_tau(a: np.ndarray, b: np.ndarray) -> float:
-    vals = []
-    for x, y in zip(a, b):
-        if np.array_equal(x, y): vals.append(1.0); continue
-        t = kendalltau(x, y, nan_policy="omit")[0]
-        if not np.isnan(t): vals.append(float(t))
-    return float(np.mean(vals)) if vals else float("nan")
-
-
-def vec_tau(a, b):
-    a = np.asarray(a); b = np.asarray(b)
-    if np.array_equal(a, b): return 1.0
-    t = kendalltau(a, b, nan_policy="omit")[0]
-    return float(t) if t is not None and not np.isnan(t) else float("nan")
-
-
-def align(ra: Run, rb: Run):
-    """Order both runs' rows by their alignment ids (they must cover the same set)."""
-    if ra.row_ids is None or rb.row_ids is None:
-        return ra, rb
-    ia = np.argsort(ra.row_ids, kind="stable"); ib = np.argsort(rb.row_ids, kind="stable")
-    if not np.array_equal(ra.row_ids[ia], rb.row_ids[ib]):
-        raise ValueError("row ids differ between variants")
-    def sub(r, idx):
-        return Run(r.variant, r.seed, r.task_type, r.scores[idx], None if r.labels is None else r.labels[idx],
-                   None if r.pos_col is None else r.pos_col[idx], None if r.ranks is None else r.ranks[idx], r.row_ids[idx], r.resources, r.stored)
-    return sub(ra, ia), sub(rb, ib)
-
-
-def invariance(ra: Run, rb: Run) -> dict:
-    ra, rb = align(ra, rb)
-    out = {"tau": row_tau(ra.scores, rb.scores)}
-    if ra.task_type == "lp":
-        # tau@k over per-query hit indicators on the CANDIDATE ranking (same candidates in every variant)
-        ka = lp_ranks(Run(ra.variant, ra.seed, "lp", ra.scores, pos_col=ra.pos_col)); kb = lp_ranks(Run(rb.variant, rb.seed, "lp", rb.scores, pos_col=rb.pos_col))
-        out["tau@1"] = vec_tau(ka <= 1, kb <= 1); out["tau@3"] = vec_tau(ka <= 3, kb <= 3)
-    return out
-
-
-# ----------------------------------------------------------------------------- resource helpers
-def res_structural(m: dict) -> dict:
-    return {"train_time_sec": m.get("train_time_sec"), "epochs": m.get("epochs"), "parameter_mib": m.get("parameter_mib"),
-            "peak_training_gpu_mib": m.get("peak_training_gpu_mib"), "peak_inference_gpu_mib": m.get("peak_inference_gpu_mib")}
-
-
-# ----------------------------------------------------------------------------- loaders
-def structural_runs(root: Path, task_type: str, dataset_dir: str, task_dir: str, variants, label_fn=None, seeds=SEEDS) -> list[Run]:
-    """RGCN-layout roots: <root>/<DATASET>/<task>/<variant>/seed_<s>/{metrics.json,scores.npz} (RGCN, MAGNN v2, CMPNN, SeHGNN)."""
-    runs = []
-    for v in variants:
-        for s in seeds:
-            d = root / dataset_dir / task_dir / v / f"seed_{s}"
-            if not (d / "metrics.json").exists(): continue
-            m = json.load(open(d / "metrics.json")); z = np.load(d / "scores.npz")
-            res = res_structural(m["metrics"])
-            if task_type == "nc":
-                ids = z["ids"]; runs.append(Run(v, s, "nc", z["scores"], label_fn(ids), row_ids=ids, resources=res))
-            else:
-                S = z["scores"]
-                if "candidate_ids" in z.files:
-                    cid = z["candidate_ids"]; pc = np.array([int(np.where(cid == t)[0][0]) for t in z["positive_tails"]])
-                else:
-                    pc = np.zeros(len(S), dtype=int)
-                runs.append(Run(v, s, "lp", S, pos_col=pc, row_ids=z["queries"] * 100003 + z["positive_tails"], resources=res))
-    return runs
-
-
-def imdb_nc_labels_rgcn():
-    import torch
-    sys.path.insert(0, str(B / "RGCN"))
-    from inv_rgcn.data import load_graph_data
-    d = load_graph_data(DATA / "RGCN_structural_v10_year_canonfeat/IMDB/nc/v1"); y = d.y.numpy()
-    return lambda ids: y[ids]
-
-
-def bundle_labels(labels_path: Path, targets_path: Path):
-    lab = np.load(labels_path); tg = np.load(targets_path); pos = {int(t): i for i, t in enumerate(tg)}
-    return lambda ids: np.array([lab[pos[int(i)]] for i in ids])
-
-
-def slotgat_runs(root: Path, condition: str, variants: dict, seeds=SEEDS) -> list[Run]:
-    runs = []
-    for v, dirname in variants.items():
-        for s in seeds:
-            d = root / condition / dirname / f"seed_{s}"
-            if not (d / "result.json").exists(): continue
-            j = json.load(open(d / "result.json")); z = np.load(d / "test_logits.npz"); mem = j["memory"]
-            res = {"train_time_sec": j["training_time_seconds"], "epochs": j["epochs_trained"], "parameter_mib": j["num_parameters"] * 4 / MIB,
-                   "peak_training_gpu_mib": mem["training_peak_allocated_bytes"] / MIB, "peak_inference_gpu_mib": mem["inference_peak_allocated_bytes"] / MIB}
-            runs.append(Run(v, s, "nc", z["logits"], z["labels"], row_ids=z["node_ids"], resources=res))
-    return runs
-
-
-def slotgat_aug_runs(root: Path, variants: dict, seeds=SEEDS) -> list[Run]:
-    runs = []
-    for s in seeds:
-        d = root / f"seed_{s}"
-        if not (d / "result.json").exists(): continue
-        j = json.load(open(d / "result.json")); mem = j["memory"]
-        res = {"train_time_sec": j["training_time_seconds"], "epochs": j["variant_epochs_run"], "parameter_mib": j["parameter_mib"],
-               "peak_training_gpu_mib": mem["training_peak_allocated_bytes"] / MIB, "peak_inference_gpu_mib": mem["inference_peak_allocated_bytes"] / MIB}
-        for v, dirname in variants.items():
-            z = np.load(d / f"{dirname}_test_logits.npz")
-            runs.append(Run(v, s, "nc", z["logits"], z["labels"], row_ids=z["node_ids"], resources=res))
-    return runs
-
-
-def rgcn_freebase_runs(root: Path, subdir_fn, variants, seeds=SEEDS) -> list[Run]:
-    runs = []
-    for v in variants:
-        for s in seeds:
-            d = root / subdir_fn(v) / f"seed_{s}"
-            if not (d / "result.json").exists(): continue
-            j = json.load(open(d / "result.json")); z = np.load(d / "logits.npz"); mem = j["memory"]
-            res = {"train_time_sec": j["train_time_sec"], "epochs": j["epochs_run"], "parameter_mib": mem["parameter_mib"],
-                   "peak_training_gpu_mib": mem["peak_training_gpu_mib"], "peak_inference_gpu_mib": mem["peak_inference_gpu_mib"]}
-            runs.append(Run(v, s, "nc", z["test_logits"], z["test_labels"], row_ids=z["test_global_ids"], resources=res))
-    return runs
-
-
-def rgcn_freebase_aug_runs(root: Path, variants, label_src: list[Run], seeds=SEEDS) -> list[Run]:
-    runs = []
-    lab = {(r.seed): r for r in label_src if r.variant == variants[0]}
-    for s in seeds:
-        d = root / f"seed_{s}"
-        if not (d / "summary.json").exists(): continue
-        j = json.load(open(d / "summary.json")); z = np.load(d / "test_logits.npz")
-        res = {"train_time_sec": j["train_seconds"], "epochs": j["variant_epochs_ran"], "parameter_mib": j["parameter_mib"],
-               "peak_training_gpu_mib": j["peak_training_gpu_mib"], "peak_inference_gpu_mib": j["peak_inference_gpu_mib"]}
-        ref = lab[s]
-        for v in variants:
-            runs.append(Run(v, s, "nc", z[v], ref.labels, row_ids=ref.row_ids, resources=res))
-    return runs
-
-
-def rgcn_dblp_aug_runs(root: Path, variants, seeds=SEEDS) -> list[Run]:
-    runs = []
-    for s in seeds:
-        d = root / f"seed_{s}"
-        if not (d / "summary.json").exists(): continue
-        j = json.load(open(d / "summary.json")); mem = j["memory"]
-        res = {"train_time_sec": j["training_seconds"], "epochs": j["epoch_accounting"]["variant_epochs_ran"], "parameter_mib": mem["parameter_bytes"] / MIB,
-               "peak_training_gpu_mib": mem["training_gpu"]["gpu_peak_allocated_bytes"] / MIB, "peak_inference_gpu_mib": mem["inference_gpu"]["gpu_peak_allocated_bytes"] / MIB}
-        for v in variants:
-            rows = list(csv.DictReader(open(d / f"test_scores_{v}.csv")))
-            by = {}
-            for r in rows:
-                pr = min(max(float(r["score"]), 1e-7), 1 - 1e-7)          # the CSV stores sigmoid probabilities -> back to logits
-                by.setdefault(int(r["paper_id"]), []).append((int(r["label"]), math.log(pr / (1 - pr)), int(r["conf_id"])))
-            qids = sorted(by); S = []; pc = []
-            for q in qids:
-                items = sorted(by[q], key=lambda t: (-t[0], t[2]))     # positive first, then negatives by conf id
-                S.append([t[1] for t in items]); pc.append(0)
-            runs.append(Run(v, s, "lp", np.array(S, dtype=np.float32), pos_col=np.array(pc), row_ids=np.array(qids), resources=res))
-    return runs
-
-
-def wordnet_structural_runs(root: Path, variants, seeds=SEEDS) -> list[Run]:
-    """RGCN WordNet structural layout: <root>/full/intersection/<variant>/seed_<s>/{metrics.json,test_scores.npz}.
-    Candidate matrix = true entity + 50 fixed negatives (column 0 = true); Hits/MRR from the FILTERED full-entity ranks."""
-    runs = []
-    for v in variants:
-        for s in seeds:
-            d = root / "full" / "intersection" / v / f"seed_{s}"
-            if not (d / "metrics.json").exists(): continue
-            j = json.load(open(d / "metrics.json")); z = np.load(d / "test_scores.npz")
-            side = z["side"]; n = len(side)
-            fr = np.where(side == 0, z["filtered_tail_ranks"][np.arange(n) // 2], z["filtered_head_ranks"][np.arange(n) // 2]).astype(float)
-            tm = j["test_metrics"]
-            stored = {"hits@1": tm["Hits@1"], "hits@3": tm["Hits@3"], "mrr": tm["filtered_MRR"]}
-            res = {"train_time_sec": j.get("train_time_sec"), "epochs": j.get("epochs_completed"), "parameter_mib": j["parameter_bytes"] / MIB,
-                   "peak_training_gpu_mib": j["peak_train_gpu_bytes"] / MIB, "peak_inference_gpu_mib": j["peak_inference_gpu_bytes"] / MIB}
-            q = z["query_triples"]; rid = (q[:, 0] * 1000003 + q[:, 1]) * 1000003 + q[:, 2] * 2 + side
-            runs.append(Run(v, s, "lp", z["candidate_scores"], pos_col=np.zeros(n, dtype=int), ranks=fr, row_ids=rid, resources=res, stored=stored))
-    return runs
-
-
-def wordnet_aug_runs(root: Path, variants, seeds=SEEDS) -> list[Run]:
-    runs = []
-    for s in seeds:
-        d = root / f"seed_{s}"
-        if not (d / "summary.json").exists(): continue
-        j = json.load(open(d / "summary.json")); mem = j["memory"]
-        res = {"train_time_sec": j["training_seconds"], "epochs": j["epoch_accounting"]["variant_epochs_ran"], "parameter_mib": mem["parameter_bytes"] / MIB,
-               "peak_training_gpu_mib": mem["training_gpu"]["gpu_peak_allocated_bytes"] / MIB, "peak_inference_gpu_mib": mem["inference_gpu"]["gpu_peak_allocated_bytes"] / MIB}
-        legacy = {r["variant"]: r for r in csv.DictReader(open(d / "legacy_test_metrics_by_variant.csv"))}
-        for v in variants:
-            rows = list(csv.DictReader(open(d / f"shared_candidate_test_scores_{v}.csv")))
-            by = {}
-            for r in rows:
-                by.setdefault(int(r["query_id"]), []).append((int(r["label"]), float(r["logit"]), int(r["tail"]), int(r["head"]), int(r["relation"])))
-            qids = sorted(by); S = []
-            for q in qids:
-                items = sorted(by[q], key=lambda t: (-t[0], t[2], t[3]))
-                S.append([t[1] for t in items])
-            lm = legacy[v]
-            stored = {"hits@1": float(lm["Hits@1"]), "hits@3": float(lm["Hits@3"]), "mrr": float(lm["filtered_MRR"])}
-            runs.append(Run(v, s, "lp", np.array(S, dtype=np.float32), pos_col=np.zeros(len(S), dtype=int), row_ids=np.array(qids), resources=res, stored=stored))
-    return runs
-
-
-# ----------------------------------------------------------------------------- registry
-def blocks() -> list[Block]:
-    out = []
-    def add(dataset, task, model, method, title, runs, note="", sources=()):
-        out.append(Block(dataset, task, model, method, title, runs, note, list(sources)))
-
-    # ---------------- IMDb NC
-    imdb = ["v1", "v2", "v3", "v4"]
-    lab = imdb_nc_labels_rgcn()
-    r = B / "RGCN/results/IMDB_year_nc_canonfeat"
-    for meth, arm in (("original", "originals"), ("canonical", "universal"), ("augmentation", "augmentation"), ("invariant", "invariant")):
-        add("IMDB", "nc", "RGCN", meth, "", structural_runs(r / arm, "nc", "IMDB", "nc", imdb if meth != "canonical" else ["universal"], lab), sources=[str(r / arm)])
-    r = B / "MAGNN/results/MAGNN_imdb_v2/nc"; labm = bundle_labels(DATA / "imdb_magnn_v2/nc/stock/v1/labels.npy", DATA / "imdb_magnn_v2/nc/stock/v1/target_nodes.npy")
-    for meth, arm, title in (("original", "originals", ""), ("canonical", "universal", ""), ("augmentation", "augmentation", ""),
-                             ("invariant", "invariant", "invariant (intersection metapaths)"), ("invariant", "invariant_union", "invariant + union metapaths")):
-        add("IMDB", "nc", "MAGNN", meth, title, structural_runs(r / arm, "nc", "IMDB", "nc", imdb if meth != "canonical" else ["universal"], labm), sources=[str(r / arm)])
-    sg = B / "SlotGAT/results"; sv = {v: f"IMDB_var{i}_year" for i, v in enumerate(imdb, 1)}
-    add("IMDB", "nc", "SlotGAT", "original", "original (upstream stock SlotGAT, 3 layers, 3.25M params)", slotgat_runs(sg / "imdb_nc_year_v2", "original", sv), sources=[str(sg / "imdb_nc_year_v2/original")])
-    add("IMDB", "nc", "SlotGAT", "original", "original (matched control: same architecture as the invariant arm on the physical graph)", slotgat_runs(sg / "imdb_nc_year_v2", "physical", sv), sources=[str(sg / "imdb_nc_year_v2/physical")])
-    add("IMDB", "nc", "SlotGAT", "canonical", "canonical (upstream stock SlotGAT on the union graph)", slotgat_runs(sg / "imdb_nc_year_v2_universal", "original", {"universal": "IMDB_var5_year"}), sources=[str(sg / "imdb_nc_year_v2_universal/original")])
-    add("IMDB", "nc", "SlotGAT", "canonical", "canonical (matched architecture on the union graph)", slotgat_runs(sg / "imdb_nc_year_v2_universal", "physical", {"universal": "IMDB_var5_year"}), sources=[str(sg / "imdb_nc_year_v2_universal/physical")])
-    add("IMDB", "nc", "SlotGAT", "augmentation", "", slotgat_aug_runs(sg / "imdb_nc_year_augmentation", sv), sources=[str(sg / "imdb_nc_year_augmentation")])
-    add("IMDB", "nc", "SlotGAT", "invariant", "", slotgat_runs(sg / "imdb_nc_year_v2", "conditional", sv), sources=[str(sg / "imdb_nc_year_v2/conditional")])
-    r = B / "SeHGNN/results/SeHGNN_v2/IMDB_nc"; labs = bundle_labels(DATA / "sehgnn_v2/IMDB/full/physical/v1/labels.npy", DATA / "sehgnn_v2/IMDB/full/physical/v1/targets.npy")
-    for meth, arm in (("original", "originals"), ("canonical", "universal"), ("augmentation", "augmentation"), ("invariant", "invariant")):
-        flavs = ("full", "restricted", "restricted_union") if meth == "invariant" else ("full", "restricted")
-        for fl in flavs:
-            title = {"full": f"{meth} (full-K channel set: every type path $\\le 4$)", "restricted": f"{meth} (restricted-K: MAGNN intersection metapaths)",
-                     "restricted_union": f"{meth} (restricted-K + union: MAGNN union metapaths)"}[fl]
-            add("IMDB", "nc", "SeHGNN", meth, title, structural_runs(r / f"{arm}_{fl}", "nc", "IMDB", "nc", imdb if meth != "canonical" else ["universal"], labs), sources=[str(r / f"{arm}_{fl}")])
-    add("IMDB", "nc", "SeHGNN", "invariant", "invariant (full-K WITHOUT skip nodes -- ablation: 143 channels, paths through Link kept)",
-        structural_runs(r / "invariant_full_noskip", "nc", "IMDB", "nc", imdb, labs), sources=[str(r / "invariant_full_noskip")])
-
-    # ---------------- IMDb LP (movie_year v1-4, movie_director v1,v3)
-    for task, variants in (("movie_year", imdb), ("movie_director", ["v1", "v3"])):
-        r = B / f"RGCN/results/IMDB_year_{task}_canonfeat"
-        for meth, arm in (("original", "originals"), ("canonical", "universal"), ("augmentation", "augmentation"), ("invariant", "invariant")):
-            add("IMDB", task, "RGCN", meth, "", structural_runs(r / arm, "lp", "IMDB", task, variants if meth != "canonical" else ["universal"]), sources=[str(r / arm)])
-        r = B / f"MAGNN/results/MAGNN_imdb_v2/{task}"
-        for meth, arm, title in (("original", "originals", ""), ("canonical", "universal", ""), ("invariant", "invariant", "invariant (intersection metapaths)"), ("invariant", "invariant_union", "invariant + union metapaths")):
-            add("IMDB", task, "MAGNN", meth, title, structural_runs(r / arm, "lp", "IMDB", task, variants if meth != "canonical" else ["universal"]), sources=[str(r / arm)])
-        add("IMDB", task, "MAGNN", "augmentation", "", [], note="no joint-training LP runner exists for MAGNN (MAGNN_IMDB_HANDOFF.md §3)")
-        r = B / f"CMPNN/results/CMPNN_structural/IMDB_{task}"
-        for meth, arm in (("original", "originals"), ("canonical", "universal"), ("augmentation", "augmentation"), ("invariant", "invariant")):
-            add("IMDB", task, "CMPNN", meth, "", structural_runs(r / arm, "lp", "IMDB", task, variants if meth != "canonical" else ["universal"]), sources=[str(r / arm)])
-
-    # ---------------- DBLP LP
-    dblp = ["v1", "v2", "v3"]
-    r = B / "RGCN/results/DBLP_one_runner"
-    for meth, arm in (("original", "originals"), ("canonical", "universal"), ("invariant", "invariant")):
-        add("DBLP", "paper_conference", "RGCN", meth, "", structural_runs(r / arm, "lp", "DBLP", "paper_conference", dblp if meth != "canonical" else ["universal"]), sources=[str(r / arm)])
-    add("DBLP", "paper_conference", "RGCN", "augmentation", "", rgcn_dblp_aug_runs(B / "rgcn_data_augmentation/results/rgcn_augmentation/DBLP_instr", dblp), sources=[str(B / "rgcn_data_augmentation/results/rgcn_augmentation/DBLP_instr")])
-    r = B / "MAGNN/results/MAGNN_dblp_v2"   # docs/MAGNN_DBLP_HANDOFF.md: v2 bundles from RGCN_structural_v8_dblp, four arms + invariant union
-    for meth, arm, title in (("original", "originals", ""), ("canonical", "universal", ""), ("augmentation", "augmentation", ""),
-                             ("invariant", "invariant", "invariant (intersection metapaths)"), ("invariant", "invariant_union", "invariant + union metapaths")):
-        add("DBLP", "paper_conference", "MAGNN", meth, title, structural_runs(r / arm, "lp", "DBLP", "paper_conference", dblp if meth != "canonical" else ["universal"]),
-            note="MAGNN DBLP v2 suite not yet run (docs/MAGNN_DBLP_HANDOFF.md)", sources=[str(r / arm)])
-    r = B / "CMPNN/results/CMPNN_structural/DBLP_paper_conference"
-    for meth, arm in (("original", "originals"), ("canonical", "universal"), ("augmentation", "augmentation"), ("invariant", "invariant")):
-        add("DBLP", "paper_conference", "CMPNN", meth, "", structural_runs(r / arm, "lp", "DBLP", "paper_conference", dblp if meth != "canonical" else ["universal"]), sources=[str(r / arm)])
-
-    # ---------------- WN18RR LP
-    wn = ["no_changes", "all_inverse_edges", "transitive_edges"]
-    add("WORDNET", "link_prediction", "RGCN", "original", "", wordnet_structural_runs(B / "RGCN/results/WORDNET_one_runner/originals", wn), sources=[str(B / "RGCN/results/WORDNET_one_runner/originals")])
-    add("WORDNET", "link_prediction", "RGCN", "canonical", "", wordnet_structural_runs(B / "RGCN/results/WORDNET_one_runner/universal", ["universal_edges"]), sources=[str(B / "RGCN/results/WORDNET_one_runner/universal")])
-    add("WORDNET", "link_prediction", "RGCN", "augmentation", "", wordnet_aug_runs(B / "rgcn_data_augmentation/results/WORDNET_augmentation_patience", wn), sources=[str(B / "rgcn_data_augmentation/results/WORDNET_augmentation_patience")])
-    add("WORDNET", "link_prediction", "RGCN", "invariant", "invariant (task_only objective, intersection catalog)", wordnet_structural_runs(B / "RGCN/results/RGCN_structural/WORDNET/patience_task_only", wn), sources=[str(B / "RGCN/results/RGCN_structural/WORDNET/patience_task_only")])
-    for meth in ("original", "canonical", "augmentation", "invariant"):
-        add("WORDNET", "link_prediction", "CMPNN", meth, "", [], note="CMPNN WN18RR array 21265369 not yet run (pending on dgxh)")
-
-    # ---------------- Freebase NC
-    fb = ["unchanged", "exact_2", "exact_3"]
-    inv = rgcn_freebase_runs(B / "RGCN/results/freebase_rgcn_block_conditional_select_val_f1", lambda v: f"range_2_3/union/all_graph/{v}", fb)
-    add("FREEBASE", "nc", "RGCN", "original", "", rgcn_freebase_runs(B / "RGCN/results/freebase_rgcn_physical_baselines_select_val_f1", lambda v: f"physical_{v}/union/all_graph/{v}", fb), sources=[str(B / "RGCN/results/freebase_rgcn_physical_baselines_select_val_f1")])
-    add("FREEBASE", "nc", "RGCN", "canonical", "", rgcn_freebase_runs(B / "RGCN/results/freebase_rgcn_physical_baselines_select_val_f1", lambda v: f"physical_{v}/union/all_graph/{v}", ["union_exact_2_3"]), sources=[str(B / "RGCN/results/freebase_rgcn_physical_baselines_select_val_f1/physical_union_exact_2_3")])
-    add("FREEBASE", "nc", "RGCN", "augmentation", "", rgcn_freebase_aug_runs(B / "RGCN/results/freebase_rgcn_augmentation_sampled_instr", fb, inv), sources=[str(B / "RGCN/results/freebase_rgcn_augmentation_sampled_instr")])
-    add("FREEBASE", "nc", "RGCN", "invariant", "", inv, sources=[str(B / "RGCN/results/freebase_rgcn_block_conditional_select_val_f1")])
-    # MAGNN / SeHGNN Freebase: loaders registered; blocks stay "(no runs)" until the dgxh arrays land
-    r = B / "MAGNN/results/MAGNN_freebase_v2"
-    labm = bundle_labels(DATA / "freebase_magnn_v2/stock/unchanged/labels.npy", DATA / "freebase_magnn_v2/stock/unchanged/target_nodes.npy") if (DATA / "freebase_magnn_v2/stock/unchanged/labels.npy").exists() else (lambda ids: ids)
-    for meth, arm, title in (("original", "originals", ""), ("canonical", "universal", ""), ("augmentation", "augmentation", ""),
-                             ("invariant", "invariant", "invariant (intersection metapaths)"), ("invariant", "invariant_union", "invariant + union metapaths")):
-        add("FREEBASE", "nc", "MAGNN", meth, title, structural_runs(r / arm, "nc", "FREEBASE", "nc", fb if meth != "canonical" else ["union_exact_2_3"], labm),
-            note="MAGNN Freebase v2 array 21259884 not yet run (pending on dgxh)", sources=[str(r / arm)])
-    for meth in ("original", "canonical", "augmentation", "invariant"):
-        add("FREEBASE", "nc", "SlotGAT", meth, "", [], note="SlotGAT Freebase phase-2 arms incomplete (dgxh continuations pending)")
-    r = B / "SeHGNN/results/SeHGNN_v2/FREEBASE_nc"
-    labs = bundle_labels(DATA / "sehgnn_v2/FREEBASE/full/physical/unchanged/labels.npy", DATA / "sehgnn_v2/FREEBASE/full/physical/unchanged/targets.npy")
-    for meth, arm in (("original", "originals"), ("canonical", "universal"), ("augmentation", "augmentation"), ("invariant", "invariant")):
-        flavs = ("full", "restricted", "restricted_union") if meth == "invariant" else ("full", "restricted")
-        for fl in flavs:
-            title = {"full": f"{meth} (full-K channel set: every type path $\\le 2$)", "restricted": f"{meth} (restricted-K: MAGNN intersection metapaths)",
-                     "restricted_union": f"{meth} (restricted-K + union: MAGNN union metapaths)"}[fl]
-            add("FREEBASE", "nc", "SeHGNN", meth, title, structural_runs(r / f"{arm}_{fl}", "nc", "FREEBASE", "nc", fb if meth != "canonical" else ["union_exact_2_3"], labs),
-                note="SeHGNN Freebase array 21264894 not yet run (pending on dgxh)", sources=[str(r / f"{arm}_{fl}")])
-    return out
-
-
-# ----------------------------------------------------------------------------- rendering
-def per_variant_table(b: Block, cols, metric_fn):
-    """rows: variant label -> list over seeds of metric dicts."""
-    by = {}
-    for r in b.runs:
-        by.setdefault(r.variant, []).append(metric_fn(r))
-    return by
-
-
-def union_variants(b: Block):
-    vs = sorted({r.variant for r in b.runs}, key=lambda v: list(VARIANT_LABEL[b.dataset]).index(v) if v in VARIANT_LABEL[b.dataset] else 99)
-    return vs
-
-
-def aug_label(dataset, variants):
-    labels = [VARIANT_LABEL[dataset][v] for v in variants]
-    base = labels[0].rstrip("0123456789"); nums = [l[len(base):] for l in labels]
-    if len(nums) > 1 and [int(n) for n in nums] == list(range(int(nums[0]), int(nums[0]) + len(nums))):
-        return f"{base}{nums[0]}-{nums[-1]}"
-    return base + ",".join(nums)
-
-
-def render_results(b: Block, cols, metric_fn):
-    lines = []
-    if not b.runs:
-        return [f"% (no runs) {b.note}"]
-    by = per_variant_table(b, cols, metric_fn)
-    if b.method == "canonical":
-        v = list(by)[0]; cells = [fmt([m[c] for m in by[v]]) for c in cols]
-        lines.append(UNION_LABEL[b.dataset] + " & " + " & ".join(f"\\multirow{{2}}{{*}}{{{c}}}" for c in cells) + r" \\")
-    elif b.method == "augmentation":
-        vs = union_variants(b)
-        for v in vs:
-            lines.append(f"% {VARIANT_LABEL[b.dataset][v]}: " + " & ".join(fmt([m[c] for m in by[v]]) for c in cols))
-        # the row: mean over variants of each seed's metric, then mean +/- std over seeds
-        seeds = sorted({r.seed for r in b.runs}); cells = []
-        for c in cols:
-            per_seed = []
-            for s in seeds:
-                vals = [metric_fn(r)[c] for r in b.runs if r.seed == s]
-                per_seed.append(float(np.mean(vals)))
-            cells.append(fmt(per_seed))
-        lines.append(aug_label(b.dataset, vs) + " & " + " & ".join(cells) + r" \\")
+def resource_summary(record: dict[str, Any], *, augmentation: bool) -> dict[str, float]:
+    resources = record.get("resources", {})
+    training_gpu = resources.get("training_gpu", {})
+    inference_gpu = resources.get("inference_gpu", {})
+    if augmentation:
+        elapsed = record.get("training_seconds")
+        accounting = record.get("epoch_accounting", {})
+        epochs = accounting.get("variant_epochs_ran", record.get("optimizer_steps"))
     else:
-        for v in union_variants(b):
-            lines.append(VARIANT_LABEL[b.dataset][v] + " & " + " & ".join(fmt([m[c] for m in by[v]]) for c in cols) + r" \\")
-    return lines
+        elapsed = record.get("elapsed_seconds")
+        epochs = record.get("epochs_trained")
+    values = {
+        "training_time_sec": elapsed,
+        "epochs": epochs,
+        "parameter_mib": resources.get("parameter_bytes"),
+        "peak_training_gpu_mib": training_gpu.get("gpu_peak_allocated_bytes"),
+        "peak_inference_gpu_mib": inference_gpu.get("gpu_peak_allocated_bytes"),
+    }
+    for key in ("parameter_mib", "peak_training_gpu_mib", "peak_inference_gpu_mib"):
+        if values[key] is not None:
+            values[key] = scalar(values[key]) / MIB
+    return {key: scalar(value) for key, value in values.items() if value is not None}
 
 
-def render_invariance(b: Block, cols):
-    if b.method == "canonical":
-        return ["% canonical: single model on the union graph, invariance is trivially 1 (skipped)"]
-    if not b.runs:
-        return [f"% (no runs) {b.note}"]
-    vs = union_variants(b); seeds = sorted({r.seed for r in b.runs}); lines = []
-    for va, vb in itertools.combinations(vs, 2):
-        per = {c: [] for c in cols}
-        for s in seeds:
-            ra = [r for r in b.runs if r.variant == va and r.seed == s]; rb = [r for r in b.runs if r.variant == vb and r.seed == s]
-            if not ra or not rb: continue
-            inv = invariance(ra[0], rb[0])
-            for c in cols: per[c].append(inv[c])
-        lines.append(f"{VARIANT_LABEL[b.dataset][va]} vs. {VARIANT_LABEL[b.dataset][vb]} & " + " & ".join(fmt(per[c]) for c in cols) + r" \\")
-    return lines
+def metric_dict(record: dict[str, Any], task: str) -> dict[str, float]:
+    if task == "nc":
+        keys = {
+            "accuracy": "test_accuracy",
+            "precision_macro": "test_precision_macro",
+            "recall_macro": "test_recall_macro",
+            "f1_micro": "test_f1_micro",
+            "f1_macro": "test_f1_macro",
+        }
+    else:
+        keys = {
+            "precision": "test_precision",
+            "recall": "test_recall",
+            "f1": "test_f1",
+            "hits_at_1": "test_hits_at_1",
+            "hits_at_3": "test_hits_at_3",
+            "mrr": "test_mrr",
+        }
+    return {name: scalar(record[source]) for name, source in keys.items()}
 
 
-def render_scal(b: Block):
-    if not b.runs:
-        return [f"% (no runs) {b.note}"]
-    def cells(runs):
-        out = []
-        for c in SCAL:
-            vals = [r.resources.get(c) for r in runs]
-            out.append(fmt(vals, SCAL_DECIMALS))
-        return out
-    by = {}
-    for r in b.runs: by.setdefault(r.variant, []).append(r)
-    if b.method == "canonical":
-        v = list(by)[0]
-        return [UNION_LABEL[b.dataset] + " & " + " & ".join(f"\\multirow{{2}}{{*}}{{{c}}}" for c in cells(by[v])) + r" \\"]
-    if b.method == "augmentation":
-        vs = union_variants(b); seeds = sorted({r.seed for r in b.runs})
-        one = [next(r for r in b.runs if r.seed == s) for s in seeds]       # shared model: one record per seed
-        return [aug_label(b.dataset, vs) + " & " + " & ".join(cells(one)) + r" \\"]
-    return [VARIANT_LABEL[b.dataset][v] + " & " + " & ".join(cells(by[v])) + r" \\" for v in union_variants(b)]
+def append_expected(
+    expected: list[ExpectedRun], dataset: str, task: str, method: str,
+    variant: str, seed: int, source: Path, action,
+) -> Run | None:
+    if not source.is_file():
+        expected.append(ExpectedRun(dataset, task, method, variant, seed, source, "missing"))
+        return None
+    try:
+        run = action()
+    except Exception as exc:
+        expected.append(ExpectedRun(dataset, task, method, variant, seed, source, "unreadable", str(exc)))
+        return None
+    expected.append(ExpectedRun(dataset, task, method, variant, seed, source, "loaded"))
+    return run
 
 
-DATASET_FILES = {"IMDB_nc": ("IMDb node classification", [("IMDB", "nc")]),
-                 "IMDB_lp": ("IMDb link prediction", [("IMDB", "movie_year"), ("IMDB", "movie_director")]),
-                 "DBLP_lp": ("DBLP link prediction (paper--conference)", [("DBLP", "paper_conference")]),
-                 "WN18RR_lp": ("WN18RR link prediction", [("WORDNET", "link_prediction")]),
-                 "Freebase_nc": ("Freebase node classification", [("FREEBASE", "nc")])}
-TASK_TITLE = {"nc": "node classification", "movie_year": "Movie--Year (MY)", "movie_director": "Movie--Director (MD)", "paper_conference": "Paper--Conference", "link_prediction": "link prediction"}
-MODELS = ["RGCN", "MAGNN", "CMPNN", "SlotGAT", "SeHGNN"]
-METHODS = ["original", "canonical", "augmentation", "invariant"]
+def regular_run(
+    dataset: str, task: str, method: str, variant: str, seed: int, path: Path
+) -> Run:
+    record = load_pt(path)
+    if task == "nc":
+        scores = as_numpy(record["y_prob"])
+        row_ids = as_numpy(record["test_node_ids"])
+        candidates = None
+    else:
+        scores = as_numpy(record["candidate_scores"])
+        heads = as_numpy(record["test_queries"])
+        tails = as_numpy(record["test_positive_tails"])
+        row_ids = np.column_stack((heads, tails))
+        candidates = as_numpy(record["candidate_ids"])
+    return Run(
+        dataset=dataset,
+        task=task,
+        method=method,
+        variant=variant,
+        seed=seed,
+        metrics=metric_dict(record, task),
+        resources=resource_summary(record, augmentation=False),
+        source=path,
+        scores=scores,
+        row_ids=row_ids,
+        candidate_ids=candidates,
+    )
 
 
-def main():
-    all_blocks = blocks()
-    OUT.mkdir(exist_ok=True)
-    index = []
-    for fname, (title, tasks) in DATASET_FILES.items():
-        lines = [f"% ===================================================================", f"% {title} -- generated by paper_tables/build_paper_tables.py",
-                 f"% mean $\\pm$ std (ddof=0) over seeds {SEEDS}; see paper_tables/README.md for metric definitions and sources",
-                 f"% ==================================================================="]
-        for section, header in (("RESULTS", None), ("INVARIANCE", None), ("SCALABILITY", None)):
-            lines += ["", "", f"%% ################################ {section} ################################"]
-            if section == "RESULTS":
-                lines.append("% NC columns: variant & accuracy & precision (macro) & recall (macro) & micro-F1 & macro-F1" if tasks[0][1] == "nc" or tasks[0][0] == "FREEBASE"
-                             else "% LP columns: variant & precision & recall & F1 & Hits@1 & Hits@3 & MRR")
-            elif section == "INVARIANCE":
-                lines.append("% NC columns: comparison & Kendall-tau" if tasks[0][1] == "nc" else "% LP columns: comparison & Kendall-tau & Kendall-tau@1 & Kendall-tau@3")
-            else:
-                lines.append("% columns: variant & train time (s) & epochs & parameters (MiB) & peak train GPU (MiB) & peak inference GPU (MiB)  [2 decimals]")
-            for model in MODELS:
-                mb = [b for b in all_blocks if b.model == model and (b.dataset, b.task) in tasks]
-                if not mb: continue
-                lines += ["", f"%% ======== {model} ========"]
-                for meth in METHODS:
-                    for (ds, task) in tasks:
-                        for b in [x for x in mb if x.method == meth and x.task == task]:
-                            head = f"% ---- {model} / {b.title or meth}" + (f" / {TASK_TITLE[task]}" if len(tasks) > 1 else "")
-                            lines.append(head)
-                            is_nc = b.runs and b.runs[0].task_type == "nc" or (not b.runs and (task == "nc"))
-                            if section == "RESULTS":
-                                rows = render_results(b, NC_COLS if is_nc else LP_COLS, nc_metrics if is_nc else lp_metrics)
-                            elif section == "INVARIANCE":
-                                rows = render_invariance(b, NC_INV if is_nc else LP_INV)
-                            else:
-                                rows = render_scal(b)
-                            lines += continue_rows(rows)
-                            lines.append("")
-        (OUT / f"{fname}.tex").write_text("\n".join(lines) + "\n")
-        index.append((fname, title))
-        print(f"wrote {OUT / f'{fname}.tex'}")
-    # sources appendix
-    src = ["# Result roots behind every block", ""]
-    for b in all_blocks:
-        src.append(f"- {b.dataset}/{b.task} / {b.model} / {b.title or b.method}: " + (", ".join(os.path.relpath(s, ROOT) for s in b.sources) if b.sources else f"(none) {b.note}") + f"  [{len(b.runs)} runs]")
-    (OUT / "SOURCES.md").write_text("\n".join(src) + "\n")
-    print(f"wrote {OUT / 'SOURCES.md'}")
+def json_metric_dict(metrics: dict[str, Any], task: str) -> dict[str, float]:
+    if task == "nc":
+        aliases = {
+            "accuracy": "Accuracy",
+            "precision_macro": "Precision_macro",
+            "recall_macro": "Recall_macro",
+            "f1_micro": "Micro_F1",
+            "f1_macro": "Macro_F1",
+        }
+    else:
+        aliases = {
+            "precision": "test_precision",
+            "recall": "test_recall",
+            "f1": "test_f1",
+            "hits_at_1": "test_hits_at_1",
+            "hits_at_3": "test_hits_at_3",
+            "mrr": "test_mrr",
+        }
+    return {name: scalar(metrics[source]) for name, source in aliases.items()}
+
+
+def read_imdb_score_csv(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise ValueError(f"empty score file: {path}")
+    logit_columns = sorted(
+        (name for name in rows[0] if name.startswith("logit_class_")),
+        key=lambda name: int(name.rsplit("_", 1)[1]),
+    )
+    row_ids = np.asarray([int(row["node_id"]) for row in rows], dtype=np.int64)
+    scores = np.asarray(
+        [[float(row[column]) for column in logit_columns] for row in rows],
+        dtype=np.float64,
+    )
+    return row_ids, scores
+
+
+def augmentation_run(
+    dataset: str, task: str, variant: str, seed: int, seed_dir: Path
+) -> Run:
+    summary_path = seed_dir / "summary.json"
+    with summary_path.open(encoding="utf-8") as handle:
+        summary = json.load(handle)
+    metrics = json_metric_dict(summary["per_variant_test_metrics"][variant], task)
+    if task == "nc":
+        result_path = seed_dir / f"test_scores_{variant}.csv"
+        row_ids, scores = read_imdb_score_csv(result_path)
+        candidates = None
+    else:
+        result_path = seed_dir / f"test_{variant}.pt"
+        result = load_pt(result_path)
+        scores = as_numpy(result["candidate_scores"])
+        heads = as_numpy(result["test_queries"])
+        tails = as_numpy(result["test_positive_tails"])
+        row_ids = np.column_stack((heads, tails))
+        candidates = as_numpy(result["candidate_ids"])
+    return Run(
+        dataset=dataset,
+        task=task,
+        method="Augmentation",
+        variant=variant,
+        seed=seed,
+        metrics=metrics,
+        resources=resource_summary(summary, augmentation=True),
+        source=result_path,
+        scores=scores,
+        row_ids=row_ids,
+        candidate_ids=candidates,
+    )
+
+
+def collect_runs(args: argparse.Namespace) -> tuple[list[Run], list[ExpectedRun]]:
+    seeds = tuple(args.seeds)
+    runs: list[Run] = []
+    expected: list[ExpectedRun] = []
+
+    imdb_original = absolute(args.imdb_original_root)
+    imdb_v4 = absolute(args.imdb_v4_root)
+    imdb_universal = absolute(args.imdb_universal_root)
+    imdb_augmentation = absolute(args.imdb_augmentation_root)
+    imdb_invariant = absolute(args.imdb_invariant_root)
+    for variant in IMDB_VARIANTS:
+        directory = imdb_v4 if variant == "v4" else imdb_original
+        folder = DISPLAY["IMDB"][variant]
+        for seed in seeds:
+            path = directory / folder / f"seed{seed}.pt"
+            run = append_expected(
+                expected, "IMDB", "nc", "Independent", variant, seed, path,
+                lambda p=path, v=variant, s=seed: regular_run("IMDB", "nc", "Independent", v, s, p),
+            )
+            if run:
+                runs.append(run)
+    for seed in seeds:
+        path = imdb_universal / "IMDb_universal" / f"seed{seed}.pt"
+        run = append_expected(
+            expected, "IMDB", "nc", "Universal graph", "universal", seed, path,
+            lambda p=path, s=seed: regular_run("IMDB", "nc", "Universal graph", "universal", s, p),
+        )
+        if run:
+            runs.append(run)
+    for variant in IMDB_VARIANTS:
+        for seed in seeds:
+            seed_dir = imdb_augmentation / f"seed_{seed}"
+            source = seed_dir / f"test_scores_{variant}.csv"
+            run = append_expected(
+                expected, "IMDB", "nc", "Augmentation", variant, seed, source,
+                lambda d=seed_dir, v=variant, s=seed: augmentation_run("IMDB", "nc", v, s, d),
+            )
+            if run:
+                runs.append(run)
+    for variant in IMDB_VARIANTS:
+        folder = f"IMDb_invariant_{variant}"
+        for seed in seeds:
+            path = imdb_invariant / folder / f"seed{seed}.pt"
+            run = append_expected(
+                expected, "IMDB", "nc", "Invariant", variant, seed, path,
+                lambda p=path, v=variant, s=seed: regular_run("IMDB", "nc", "Invariant", v, s, p),
+            )
+            if run:
+                runs.append(run)
+
+    dblp_original = absolute(args.dblp_original_root)
+    dblp_augmentation = absolute(args.dblp_augmentation_root)
+    dblp_invariant = absolute(args.dblp_invariant_root)
+    for variant in DBLP_VARIANTS:
+        folder = DISPLAY["DBLP"][variant]
+        for seed in seeds:
+            path = dblp_original / folder / f"seed{seed}.pt"
+            run = append_expected(
+                expected, "DBLP", "lp", "Independent", variant, seed, path,
+                lambda p=path, v=variant, s=seed: regular_run("DBLP", "lp", "Independent", v, s, p),
+            )
+            if run:
+                runs.append(run)
+    for seed in seeds:
+        path = dblp_original / "DBLP_universal" / f"seed{seed}.pt"
+        run = append_expected(
+            expected, "DBLP", "lp", "Universal graph", "universal", seed, path,
+            lambda p=path, s=seed: regular_run("DBLP", "lp", "Universal graph", "universal", s, p),
+        )
+        if run:
+            runs.append(run)
+    for variant in DBLP_VARIANTS:
+        for seed in seeds:
+            seed_dir = dblp_augmentation / f"seed_{seed}"
+            source = seed_dir / f"test_{variant}.pt"
+            run = append_expected(
+                expected, "DBLP", "lp", "Augmentation", variant, seed, source,
+                lambda d=seed_dir, v=variant, s=seed: augmentation_run("DBLP", "lp", v, s, d),
+            )
+            if run:
+                runs.append(run)
+    for variant in DBLP_VARIANTS:
+        folder = f"DBLP_invariant_{variant}"
+        for seed in seeds:
+            path = dblp_invariant / folder / f"seed{seed}.pt"
+            run = append_expected(
+                expected, "DBLP", "lp", "Invariant", variant, seed, path,
+                lambda p=path, v=variant, s=seed: regular_run("DBLP", "lp", "Invariant", v, s, p),
+            )
+            if run:
+                runs.append(run)
+    return runs, expected
+
+
+def result_specs(dataset: str) -> list[RowSpec]:
+    variants = IMDB_VARIANTS if dataset == "IMDB" else DBLP_VARIANTS
+    union = r"$\bigcup_i \mathrm{IMDb}_i$" if dataset == "IMDB" else r"$\bigcup_i \mathrm{DBLP}_i$"
+    rows = [RowSpec("Independent", v, DISPLAY[dataset][v]) for v in variants]
+    rows.append(RowSpec("Universal graph", "universal", union))
+    rows.extend(RowSpec("Augmentation", v, DISPLAY[dataset][v]) for v in variants)
+    rows.extend(RowSpec("Invariant", v, DISPLAY[dataset][v]) for v in variants)
+    return rows
+
+
+def matching(runs: Iterable[Run], dataset: str, method: str, variant: str) -> list[Run]:
+    return sorted(
+        (run for run in runs if run.dataset == dataset and run.method == method and run.variant == variant),
+        key=lambda run: run.seed,
+    )
+
+
+def finite(values: Iterable[float | None]) -> list[float]:
+    return [float(v) for v in values if v is not None and math.isfinite(float(v))]
+
+
+def mean_std(values: Iterable[float | None]) -> tuple[float | None, float | None]:
+    values = finite(values)
+    if not values:
+        return None, None
+    return float(np.mean(values)), float(np.std(values, ddof=0))
+
+
+def latex_stat(values: Iterable[float | None], count: int, expected: int, decimals: int) -> str:
+    mean, deviation = mean_std(values)
+    if mean is None:
+        return "--"
+    result = rf"${mean:.{decimals}f} \pm {deviation:.{decimals}f}$"
+    if count < expected:
+        result += r"\textsuperscript{$\dagger$}"
+    return result
+
+
+def write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def table_document(
+    *, columns: str, header: str, body: list[str], caption: str, label: str, note: str
+) -> str:
+    return "\n".join(
+        [
+            "% Generated by build_paper_tables.py; do not hand-edit this copy.",
+            r"\begin{table*}[t]",
+            r"\centering",
+            rf"\caption{{{caption}}}",
+            rf"\label{{{label}}}",
+            r"\resizebox{\textwidth}{!}{%",
+            rf"\begin{{tabular}}{{{columns}}}",
+            r"\toprule",
+            header + r" \\",
+            r"\midrule",
+            *[row + r" \\" for row in body],
+            r"\bottomrule",
+            r"\end{tabular}%",
+            r"}",
+            r"\begin{minipage}{0.99\textwidth}\footnotesize",
+            note,
+            r"\end{minipage}",
+            r"\end{table*}",
+            "",
+        ]
+    )
+
+
+def write_results(dataset: str, task: str, runs: list[Run], seeds: tuple[int, ...], out: Path) -> None:
+    metrics = NC_METRICS if task == "nc" else LP_METRICS
+    aggregate_rows: list[dict[str, Any]] = []
+    tex_rows: list[str] = []
+    for spec in result_specs(dataset):
+        group = matching(runs, dataset, spec.method, spec.variant)
+        record: dict[str, Any] = {
+            "dataset": dataset,
+            "task": task,
+            "method": spec.method,
+            "variant": spec.variant,
+            "n_seeds": len(group),
+            "expected_seeds": len(seeds),
+            "complete": len(group) == len(seeds),
+        }
+        cells = [spec.method, spec.label, f"{len(group)}/{len(seeds)}"]
+        for key, _label in metrics:
+            mean, deviation = mean_std(run.metrics.get(key) for run in group)
+            record[f"{key}_mean"] = mean
+            record[f"{key}_std"] = deviation
+            cells.append(latex_stat((run.metrics.get(key) for run in group), len(group), len(seeds), 4))
+        aggregate_rows.append(record)
+        tex_rows.append(" & ".join(cells))
+
+    metric_fields = [name for key, _ in metrics for name in (f"{key}_mean", f"{key}_std")]
+    prefix = "PAIN_IMDB_nc" if dataset == "IMDB" else "PAIN_DBLP_lp"
+    write_csv(
+        out / f"{prefix}_results.csv",
+        aggregate_rows,
+        ["dataset", "task", "method", "variant", "n_seeds", "expected_seeds", "complete", *metric_fields],
+    )
+    metric_header = " & ".join(label for _key, label in metrics)
+    caption_task = "IMDb node classification" if task == "nc" else "DBLP paper--conference link prediction"
+    note = (
+        r"Mean $\pm$ population standard deviation over seeds. The Seeds column is loaded/expected. "
+        r"$\dagger$ marks a provisional statistic computed from an incomplete seed set; -- means no run is available. "
+        r"IMDb4 independent runs and all IMDb augmentation rows come from the corrected v4 result roots."
+        if dataset == "IMDB"
+        else
+        r"Mean $\pm$ population standard deviation over seeds. The Seeds column is loaded/expected. "
+        r"$\dagger$ marks a provisional statistic computed from an incomplete seed set; -- means no run is available. "
+        r"Ranking metrics use the filtered full-conference evaluation stored by each run."
+    )
+    tex = table_document(
+        columns="lll" + "c" * len(metrics),
+        header=f"Method & Evaluation graph & Seeds & {metric_header}",
+        body=tex_rows,
+        caption=f"PAIN results for {caption_task}.",
+        label=f"tab:pain-{'imdb-nc' if task == 'nc' else 'dblp-lp'}-results",
+        note=note,
+    )
+    (out / f"{prefix}_results.tex").write_text(tex, encoding="utf-8")
+
+
+def id_keys(values: np.ndarray) -> list[Any]:
+    array = np.asarray(values)
+    if array.ndim == 1:
+        return [value.item() if hasattr(value, "item") else value for value in array]
+    return [tuple(row.tolist()) for row in array]
+
+
+def aligned_scores(left: Run, right: Run) -> tuple[np.ndarray, np.ndarray]:
+    if left.scores is None or right.scores is None or left.row_ids is None or right.row_ids is None:
+        raise ValueError("run has no score matrix or row identifiers")
+    left_keys = id_keys(left.row_ids)
+    right_keys = id_keys(right.row_ids)
+    right_positions = {key: index for index, key in enumerate(right_keys)}
+    common = [key for key in left_keys if key in right_positions]
+    if not common:
+        raise ValueError("variant pair has no shared test rows")
+    left_positions = {key: index for index, key in enumerate(left_keys)}
+    left_scores = left.scores[[left_positions[key] for key in common]]
+    right_scores = right.scores[[right_positions[key] for key in common]]
+
+    if left.candidate_ids is not None and right.candidate_ids is not None:
+        left_candidates = id_keys(left.candidate_ids)
+        right_candidates = id_keys(right.candidate_ids)
+        right_columns = {key: index for index, key in enumerate(right_candidates)}
+        shared_candidates = [key for key in left_candidates if key in right_columns]
+        if not shared_candidates:
+            raise ValueError("variant pair has no shared ranking candidates")
+        left_columns = {key: index for index, key in enumerate(left_candidates)}
+        left_scores = left_scores[:, [left_columns[key] for key in shared_candidates]]
+        right_scores = right_scores[:, [right_columns[key] for key in shared_candidates]]
+    if left_scores.shape != right_scores.shape:
+        raise ValueError(f"aligned score shapes differ: {left_scores.shape} vs {right_scores.shape}")
+    return left_scores, right_scores
+
+
+def rowwise_kendall(left: Run, right: Run) -> float:
+    left_scores, right_scores = aligned_scores(left, right)
+    values: list[float] = []
+    for left_row, right_row in zip(left_scores, right_scores, strict=True):
+        if np.array_equal(left_row, right_row):
+            values.append(1.0)
+            continue
+        value = kendalltau(left_row, right_row, variant="b", nan_policy="omit").statistic
+        if value is not None and math.isfinite(float(value)):
+            values.append(float(value))
+    return float(np.mean(values)) if values else float("nan")
+
+
+def write_invariance(dataset: str, runs: list[Run], seeds: tuple[int, ...], out: Path) -> None:
+    variants = IMDB_VARIANTS if dataset == "IMDB" else DBLP_VARIANTS
+    methods = ("Independent", "Augmentation", "Invariant")
+    seed_rows: list[dict[str, Any]] = []
+    aggregate_rows: list[dict[str, Any]] = []
+    tex_rows: list[str] = []
+    for method in methods:
+        for left_variant, right_variant in itertools.combinations(variants, 2):
+            values: list[float] = []
+            for seed in seeds:
+                left = next((run for run in runs if run.dataset == dataset and run.method == method and run.variant == left_variant and run.seed == seed), None)
+                right = next((run for run in runs if run.dataset == dataset and run.method == method and run.variant == right_variant and run.seed == seed), None)
+                if left is None or right is None:
+                    continue
+                try:
+                    tau = rowwise_kendall(left, right)
+                except ValueError:
+                    continue
+                if math.isfinite(tau):
+                    values.append(tau)
+                    seed_rows.append(
+                        {"dataset": dataset, "method": method, "variant_a": left_variant, "variant_b": right_variant, "seed": seed, "kendall_tau_b": tau}
+                    )
+            mean, deviation = mean_std(values)
+            aggregate_rows.append(
+                {
+                    "dataset": dataset,
+                    "method": method,
+                    "variant_a": left_variant,
+                    "variant_b": right_variant,
+                    "matched_seeds": len(values),
+                    "expected_seeds": len(seeds),
+                    "complete": len(values) == len(seeds),
+                    "kendall_tau_b_mean": mean,
+                    "kendall_tau_b_std": deviation,
+                }
+            )
+            pair = f"{DISPLAY[dataset][left_variant]}--{DISPLAY[dataset][right_variant]}"
+            tex_rows.append(" & ".join([method, pair, f"{len(values)}/{len(seeds)}", latex_stat(values, len(values), len(seeds), 4)]))
+
+    prefix = "PAIN_IMDB_nc" if dataset == "IMDB" else "PAIN_DBLP_lp"
+    write_csv(
+        out / f"{prefix}_invariance_per_seed.csv",
+        seed_rows,
+        ["dataset", "method", "variant_a", "variant_b", "seed", "kendall_tau_b"],
+    )
+    write_csv(
+        out / f"{prefix}_invariance.csv",
+        aggregate_rows,
+        ["dataset", "method", "variant_a", "variant_b", "matched_seeds", "expected_seeds", "complete", "kendall_tau_b_mean", "kendall_tau_b_std"],
+    )
+    task_name = "IMDb node classification" if dataset == "IMDB" else "DBLP link prediction"
+    tex = table_document(
+        columns="llcc",
+        header=r"Method & Variant pair & Matched seeds & Kendall $\tau_b$",
+        body=tex_rows,
+        caption=f"PAIN representation invariance for {task_name}.",
+        label=f"tab:pain-{'imdb-nc' if dataset == 'IMDB' else 'dblp-lp'}-invariance",
+        note=(
+            r"For each matched seed and test node/query, Kendall's $\tau_b$ compares the class/candidate score rankings; "
+            r"the test-row mean is then aggregated across seeds. Identical score rows are assigned $\tau_b=1$. "
+            r"$\dagger$ marks an incomplete matched-seed set; -- means no matched pair is available. "
+            r"The universal-graph arm has only one representation and therefore has no cross-variant pair."
+        ),
+    )
+    (out / f"{prefix}_invariance.tex").write_text(tex, encoding="utf-8")
+
+
+def scalability_specs(dataset: str) -> list[RowSpec]:
+    variants = IMDB_VARIANTS if dataset == "IMDB" else DBLP_VARIANTS
+    union = r"$\bigcup_i \mathrm{IMDb}_i$" if dataset == "IMDB" else r"$\bigcup_i \mathrm{DBLP}_i$"
+    rows = [RowSpec("Independent", v, DISPLAY[dataset][v]) for v in variants]
+    rows.append(RowSpec("Universal graph", "universal", union))
+    rows.append(RowSpec("Augmentation", "shared", f"{DISPLAY[dataset][variants[0]]}--{DISPLAY[dataset][variants[-1]]} (shared)"))
+    rows.extend(RowSpec("Invariant", v, DISPLAY[dataset][v]) for v in variants)
+    return rows
+
+
+def write_scalability(dataset: str, runs: list[Run], seeds: tuple[int, ...], out: Path) -> None:
+    aggregate_rows: list[dict[str, Any]] = []
+    tex_rows: list[str] = []
+    for spec in scalability_specs(dataset):
+        candidates = matching(runs, dataset, spec.method, "v1" if spec.variant == "shared" else spec.variant)
+        group = list({run.seed: run for run in candidates}.values())
+        record: dict[str, Any] = {
+            "dataset": dataset,
+            "method": spec.method,
+            "training_graph": spec.variant,
+            "n_seeds": len(group),
+            "expected_seeds": len(seeds),
+            "complete": len(group) == len(seeds),
+        }
+        cells = [spec.method, spec.label, f"{len(group)}/{len(seeds)}"]
+        for key, _label in SCALABILITY_METRICS:
+            values = [run.resources.get(key) for run in group]
+            mean, deviation = mean_std(values)
+            record[f"{key}_mean"] = mean
+            record[f"{key}_std"] = deviation
+            cells.append(latex_stat(values, len(group), len(seeds), 2))
+        aggregate_rows.append(record)
+        tex_rows.append(" & ".join(cells))
+
+    metric_fields = [name for key, _ in SCALABILITY_METRICS for name in (f"{key}_mean", f"{key}_std")]
+    prefix = "PAIN_IMDB_nc" if dataset == "IMDB" else "PAIN_DBLP_lp"
+    write_csv(
+        out / f"{prefix}_scalability.csv",
+        aggregate_rows,
+        ["dataset", "method", "training_graph", "n_seeds", "expected_seeds", "complete", *metric_fields],
+    )
+    header = "Method & Training graph & Seeds & " + " & ".join(label for _key, label in SCALABILITY_METRICS)
+    tex = table_document(
+        columns="lll" + "c" * len(SCALABILITY_METRICS),
+        header=header,
+        body=tex_rows,
+        caption=f"PAIN scalability for {'IMDb node classification' if dataset == 'IMDB' else 'DBLP link prediction'}.",
+        label=f"tab:pain-{'imdb-nc' if dataset == 'IMDB' else 'dblp-lp'}-scalability",
+        note=(
+            r"Mean $\pm$ population standard deviation. GPU columns report peak allocated memory, not reserved memory. "
+            r"Parameters exclude buffers. For augmentation, epochs/updates are variant-level optimizer updates and the shared row is reported once. "
+            r"$\dagger$ marks an incomplete seed set; -- means no run is available."
+        ),
+    )
+    (out / f"{prefix}_scalability.tex").write_text(tex, encoding="utf-8")
+
+
+def write_raw_runs(runs: list[Run], out: Path) -> None:
+    metric_names = sorted({name for run in runs for name in run.metrics})
+    resource_names = sorted({name for run in runs for name in run.resources})
+    rows = []
+    for run in sorted(runs, key=lambda item: (item.dataset, item.method, item.variant, item.seed)):
+        rows.append(
+            {
+                "dataset": run.dataset,
+                "task": run.task,
+                "method": run.method,
+                "variant": run.variant,
+                "seed": run.seed,
+                "source": str(run.source.relative_to(REPO) if run.source.is_relative_to(REPO) else run.source),
+                **run.metrics,
+                **run.resources,
+            }
+        )
+    write_csv(
+        out / "PAIN_all_loaded_runs.csv",
+        rows,
+        ["dataset", "task", "method", "variant", "seed", "source", *metric_names, *resource_names],
+    )
+
+
+def write_completeness(expected: list[ExpectedRun], out: Path, seeds: tuple[int, ...]) -> None:
+    grouped: dict[tuple[str, str, str, str], list[ExpectedRun]] = {}
+    for item in expected:
+        grouped.setdefault((item.dataset, item.task, item.method, item.variant), []).append(item)
+    lines = [
+        "# PAIN paper-table completeness",
+        "",
+        f"Expected seeds: `{', '.join(str(seed) for seed in seeds)}`.",
+        "",
+        "The builder reads per-run artifacts. It does not use the overwrite-prone top-level aggregate CSV files.",
+        "",
+        "| Dataset/task | Method | Variant | Loaded | Missing or unreadable seeds |",
+        "|---|---|---:|---:|---|",
+    ]
+    for (dataset, task, method, variant), items in sorted(grouped.items()):
+        loaded = sorted(item.seed for item in items if item.state == "loaded")
+        unavailable = [f"{item.seed} ({item.state})" for item in items if item.state != "loaded"]
+        lines.append(
+            f"| {dataset}/{task.upper()} | {method} | {variant} | {len(loaded)}/{len(seeds)} | {', '.join(unavailable) or '--'} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Source policy",
+            "",
+            "- IMDb independent v1--v3: `results/imdb_nc/`.",
+            "- IMDb independent v4: `results/imdb_nc_v4_fixed/` (the earlier v4 is intentionally ignored).",
+            "- IMDb augmentation: `results/imdb_nc_augmentation_v4_fixed/` (the earlier augmentation root is intentionally ignored).",
+            "- IMDb universal and invariant: their dedicated result roots.",
+            "- DBLP independent and universal: `results/dblp_lp/`; augmentation and invariant: their dedicated result roots.",
+            "",
+            "## LaTeX use",
+            "",
+            "Add `\\usepackage{booktabs}` and `\\usepackage{graphicx}` to the paper preamble, then use e.g. "
+            "`\\input{tables/PAIN_IMDB_nc_results.tex}` after uploading the desired `.tex` files to Overleaf.",
+            "",
+            "Rows marked with a dagger are provisional because fewer than all requested seeds were available.",
+            "",
+        ]
+    )
+    (out / "PAIN_COMPLETENESS.md").write_text("\n".join(lines), encoding="utf-8")
+
+    csv_rows = [
+        {
+            "dataset": item.dataset,
+            "task": item.task,
+            "method": item.method,
+            "variant": item.variant,
+            "seed": item.seed,
+            "state": item.state,
+            "source": str(item.source.relative_to(REPO) if item.source.is_relative_to(REPO) else item.source),
+            "detail": item.detail,
+        }
+        for item in expected
+    ]
+    write_csv(
+        out / "PAIN_COMPLETENESS.csv",
+        csv_rows,
+        ["dataset", "task", "method", "variant", "seed", "state", "source", "detail"],
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    seeds = tuple(args.seeds)
+    out = absolute(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    runs, expected = collect_runs(args)
+    write_raw_runs(runs, out)
+    write_results("IMDB", "nc", runs, seeds, out)
+    write_invariance("IMDB", runs, seeds, out)
+    write_scalability("IMDB", runs, seeds, out)
+    write_results("DBLP", "lp", runs, seeds, out)
+    write_invariance("DBLP", runs, seeds, out)
+    write_scalability("DBLP", runs, seeds, out)
+    write_completeness(expected, out, seeds)
+    loaded = sum(item.state == "loaded" for item in expected)
+    missing = len(expected) - loaded
+    print(f"Wrote PAIN paper tables to {out}")
+    print(f"Loaded {loaded}/{len(expected)} expected run outputs; unavailable: {missing}")
+    print(f"Completeness report: {out / 'PAIN_COMPLETENESS.md'}")
 
 
 if __name__ == "__main__":

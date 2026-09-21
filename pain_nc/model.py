@@ -268,6 +268,9 @@ class PainNodeClassifier(nn.Module):
         num_classes: int,
         num_node_types: int,
         num_edge_types: int,
+        num_nodes: int | None = None,
+        use_node_id_embeddings: bool = False,
+        node_embedding_init_std: float = 0.1,
         hidden_dim: int = 128,
         num_layers: int = 5,
         lstm_depth: int = 2,
@@ -290,6 +293,17 @@ class PainNodeClassifier(nn.Module):
         self.jumping_knowledge = jumping_knowledge
         self.use_node_types = use_node_types
         self.node_encoder = nn.Linear(input_dim, hidden_dim)
+        if use_node_id_embeddings:
+            if num_nodes is None or num_nodes < 1:
+                raise ValueError(
+                    "num_nodes must be positive when use_node_id_embeddings is true"
+                )
+            if node_embedding_init_std <= 0:
+                raise ValueError("node_embedding_init_std must be positive")
+            self.node_embedding = nn.Embedding(num_nodes, hidden_dim)
+            nn.init.normal_(self.node_embedding.weight, std=node_embedding_init_std)
+        else:
+            self.node_embedding = None
         self.node_type_embedding = (
             nn.Embedding(num_node_types, hidden_dim) if use_node_types else None
         )
@@ -334,6 +348,9 @@ class PainNodeClassifier(nn.Module):
 
     def node_embeddings(self, graph: PainGraph) -> torch.Tensor:
         x = self.node_encoder(graph.x)
+        if self.node_embedding is not None:
+            # PainGraph rows retain the canonical global node-id order.
+            x = x + self.node_embedding.weight
         if self.node_type_embedding is not None:
             x = x + self.node_type_embedding(graph.node_type)
         layer_outputs = []
