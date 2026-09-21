@@ -356,10 +356,54 @@ python -m experiments.link_prediction.dblp_augmentation \
 
 Add `--resume` after a time-limited interruption.
 
+## Freebase independent node classification
+
+Freebase uses the three physical variants `unchanged`, `exact_2`, and
+`exact_3`. The `range_2_3` name belongs to the later invariant semantic
+catalog; it is not a fourth physical training variant. Because the materialized
+graphs can contain hundreds of millions of edges, PAIN paths are sampled with
+a deterministic relation-stratified cap instead of being enumerated
+exhaustively. Report these experiments as **sampled PAIN**.
+
+Preprocess all three physical variants (replace the first path with the raw
+Freebase variant root on the cluster):
+
+```bash
+python -m preprocessing.freebase_node_classification \
+  --variants-root /path/to/dataset_variant_3hops_filtered \
+  --output-dir data/preprocessed/Freebase \
+  --variants unchanged exact_2 exact_3 \
+  --max-neighbors-per-relation 4 \
+  --path-fanout 8 \
+  --max-paths-per-root 256 \
+  --sampling-seed 1566911444 \
+  --split-seed 1566911444
+```
+
+Use `--resume` if a multi-variant preprocessing job is interrupted. The
+compiler retains completed variant artifacts and continues with the first
+missing variant.
+
+Train the independent arm on the three standard seeds:
+
+```bash
+python -m experiments.node_classification.benchmark_freebase \
+  --config configs/freebase_nc.yaml \
+  --variants Freebase1 Freebase2 Freebase3 \
+  --seeds 1566911444 20241017 20251017 \
+  --output-root results/freebase_nc
+```
+
+The checked-in H100-oriented configuration retains PAIN's 5-layer, length-3
+architecture, streams path chunks from host memory, uses learned node-id/type
+embeddings for featureless Freebase nodes, and trains for at most 300 epochs
+with validation Macro-F1 early stopping patience 30. Existing completed runs
+are loaded unless `--overwrite` is explicitly supplied.
+
 ## Repository layout
 
 ```text
-preprocessing/                 raw IMDb/DBLP -> shared and L=3 path tensors
+preprocessing/                 raw IMDb/DBLP/Freebase -> bounded L=3 path tensors
 pain_nc/                       PAIN node-classification and link models
 configs/imdb_nc.yaml           faithful default experiment configuration
 configs/imdb_nc_invariant.yaml invariant IMDb1-4 input contract
@@ -367,6 +411,7 @@ experiments/node_classification/
                                training and multi-variant benchmark
 experiments/link_prediction/   DBLP training and seven-arm benchmark
 configs/dblp_lp.yaml           corrected full-ranking DBLP contract
+configs/freebase_nc.yaml       sampled PAIN Freebase independent-arm defaults
 analysis/                      matched-seed Kendall tau analysis
 scripts/hpc/                   cluster-side pipeline wrapper
 ```
