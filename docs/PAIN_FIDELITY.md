@@ -76,9 +76,11 @@ semantic deduplication, canonical ordering, and deterministic reductions. Its
 preprocessor aborts unless raw physical hashes differ and compiled semantic
 hashes match across DBLP1-3.
 
-## Dataset-contract caveat
+## IMDb four-variant contract
 
-The current IMDb `v4` intentionally reproduces the legacy DHN graph, which omits
-Actor1 while retaining Actor2/3 directly. This is a dataset compatibility choice,
-not part of PAIN. A paper-compatible information-preserving `v4` should be added
-under a distinct, explicit contract before invariant experiments are claimed.
+IMDb `v4` follows the paper and `INV-RGCN-guide`: Movie-Link and Link-Director
+edges are accompanied by the complete Movie-Actor relation, including Actor1.
+Legacy artifacts produced before this correction omitted Actor1 and must not be
+used for invariant experiments. The invariant preprocessor fails unless all
+four physical variants independently compile to the same semantic graph and
+complete exact PAIN path program.
