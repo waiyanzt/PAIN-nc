@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+tmp/
 runs/
 results/
 reports/
@@ -9,3 +10,4 @@ checkpoints/
 data/raw/__MACOSX/
 data/raw/dataset_variant_3hops_filter/
 data/raw/
+tests/
