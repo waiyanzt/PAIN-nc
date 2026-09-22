@@ -1,165 +1,293 @@
-# PAIN Node Classification
+# PAIN experiments
 
-This repository adapts the official PAIN (PAth Isomorphism Network) model from
-*The Expressive Power of Path-Based Graph Neural Networks* to node
-classification. Graph pooling is omitted at the model output; the final PAIN
-node embeddings are passed to a node-wise classification head.
+This repository adapts the official PAIN (PAth Isomorphism Network) model to
+the experiments used by this project. Node-classification runs keep PAIN's
+node embeddings, omit graph pooling, and classify each target node.
 
-The current end-to-end benchmark is IMDb. DBLP and Freebase raw files are
-reserved for later work and are not used by this pipeline.
+The standard seeds are `1566911444`, `20241017`, and `20251017`. Run commands
+from the repository root. Existing completed seed artifacts are skipped unless
+`--overwrite` is supplied.
 
-## What is faithful and what changed
+## HPC environment
 
-The default model configuration follows the official PAIN ZINC experiment:
-`L=3`, five PAIN layers, a two-layer LSTM, hidden size 128, shared LSTM
-weights, reversed paths, neighbor marking, sum path aggregation, no dropout,
-and a two-layer prediction MLP.
-
-The task adaptation is intentionally narrow:
-
-- the graph-level pooling/readout is removed;
-- the classifier consumes the final embedding of each node;
-- IMDb bag-of-words features use a linear encoder, with a learned node-type
-  embedding and learned edge-type embeddings;
-- exact path aggregation is evaluated in chunks to control peak memory.
-
-Chunking does not sample or discard paths. It produces the same sum as
-processing all paths at once.
-
-## Setup
-
-The default HPC target is an NVIDIA V100 (Volta, compute capability 7.0).
-`requirements.txt` therefore pins the CUDA 12.6 build of PyTorch 2.13, which
-contains V100 kernels. CUDA 13 PyTorch wheels do not support Volta.
+Load Python and CUDA inside every Slurm job, then activate the repository
+environment:
 
 ```bash
-python -m venv .venv
+module add python/3.11 cuda/12.6
+
+cd ~/hpc-share/PAIN-nc
 source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
 ```
 
-No PyTorch Geometric dependency is required.
-
-Verify the environment on an allocated GPU before preprocessing or training:
+Create the environment once after cloning or updating the repository:
 
 ```bash
-python -c "import torch; print(torch.__version__); print(torch.cuda.get_device_name(0)); print(torch.cuda.get_device_capability(0)); print(torch.cuda.get_arch_list()); print(torch.ones(1, device='cuda'))"
+module add python/3.11 cuda/12.6
+cd ~/hpc-share/PAIN-nc
+
+uv venv --python 3.11 .venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
 ```
 
-On a V100, the version should end in `+cu126`, the device capability should be
-`(7, 0)`, and the architecture list should contain `sm_70`.
+Place the same module and activation commands before the experiment command in
+each Slurm job. Freebase preprocessing is CPU- and storage-heavy; its H100 is
+mainly useful during training.
 
-## IMDb preprocessing
+## Expected data layout
 
-The IMDB contract follows the existing `dhn_nclp` node-classification
-benchmark: the same 4,180 movie targets, Action/Comedy/Drama labels, node
-features, four topology variants, universal union graph, and deterministic
-70/10/20 split.
+```text
+data/raw/IMDB/movie_metadata.csv
+data/raw/DBLP/
+data/raw/freebase_node/dataset_variant_3hops_filter/
+  unchanged/
+  exact_2/
+  exact_3/
+  union_exact_2_3/
+```
 
-PAIN preprocessing is fixed at path length `L=3`. Every simple path with zero
-through three edges is materialized for every root node. Paths are not sampled.
+For Freebase, `exact_3` and `union_exact_2_3` must be the reconstructed outputs
+from `range_2_3`; `range_2_3` itself is not the universal graph. The PAIN
+preprocessors below consume those directories but do not rebuild the raw
+Freebase variants.
 
-From the repository root:
+## IMDb node classification
+
+Preprocess the four physical variants and universal graph:
 
 ```bash
 python -m preprocessing.imdb_node_classification
 ```
 
-Outputs are written to `data/preprocessed/IMDB/`:
-
-```text
-shared.pt          features, labels, node types, and split masks
-v1_L3.pt           v1 edges and PAIN path tensors
-v2_L3.pt           v2 edges and PAIN path tensors
-v3_L3.pt           v3 edges and PAIN path tensors
-v4_L3.pt           v4 edges and PAIN path tensors
-universal_L3.pt    union-graph edges and PAIN path tensors
-metadata.json      preprocessing counts and provenance
-vocabulary.json    plot-keyword feature vocabulary
-```
-
-The variant files use the field names from the original PAIN implementation:
-`path_index`, `path_lengths`, `mask_index`, `path_edge_idx`,
-`neighbor_mask`, and `distances`.
-
-The generated `.pt` files are intentionally ignored by Git; regenerate them
-after cloning on the HPC server. Approximate local sizes are 181 MiB for
-`shared.pt`, 33–131 MiB for each baseline graph, and 524 MiB for the universal
-graph. The universal graph contains 3,801,790 exact rooted paths.
-
-## Benchmark
-
-First validate that every generated artifact is present:
+Build the four independently compiled invariant artifacts:
 
 ```bash
-python -m experiments.node_classification.benchmark_imdb --preflight-only
+python -m preprocessing.imdb_invariant \
+  --output-dir data/preprocessed/IMDB_invariant
 ```
 
-Run the complete five-variant, three-seed benchmark:
+Run the four independent variants. IMDb4 is kept in the corrected result root
+expected by `build_paper_tables.py`:
 
 ```bash
 python -m experiments.node_classification.benchmark_imdb \
   --config configs/imdb_nc.yaml \
+  --variants IMDb1 IMDb2 IMDb3 \
+  --seeds 1566911444 20241017 20251017 \
   --output-root results/imdb_nc
+
+python -m experiments.node_classification.benchmark_imdb \
+  --config configs/imdb_nc.yaml \
+  --variants IMDb4 \
+  --seeds 1566911444 20241017 20251017 \
+  --output-root results/imdb_nc_v4_fixed
 ```
 
-The standard seeds are `1566911444`, `20241017`, and `20251017`. A smaller
-selection can be used for a shakedown run:
+Run the universal graph:
 
 ```bash
 python -m experiments.node_classification.benchmark_imdb \
-  --variants IMDb4 \
-  --seeds 1566911444
+  --config configs/imdb_nc.yaml \
+  --variants IMDb_universal \
+  --seeds 1566911444 20241017 20251017 \
+  --output-root results/imdb_nc_universal
 ```
 
-Each run writes `results/imdb_nc/<variant>/seed<seed>.pt`. The artifact includes
-the complete configuration, validation-selected epoch, metrics, test node IDs,
-class probabilities (`y_prob`), predictions, and labels. Aggregate run and
-mean/sample-standard-deviation tables are written beside those directories.
-Existing run artifacts are reused unless `--overwrite` is supplied.
-
-The faithful default is computationally expensive because each of five PAIN
-layers processes every rooted path. Important memory controls in
-`configs/imdb_nc.yaml` are:
-
-- `path_chunk_size`: reduce it if a chunk itself exhausts memory;
-- `checkpoint_chunks: true`: recompute LSTM activations during backward;
-- `paths_on_device: false`: stream path indices from CPU if the complete
-  universal path artifact does not fit on the GPU.
-
-Changing these controls does not change which paths are used. If a scheduler
-time limit is shorter than 12 hours, set `training.max_hours` below the job
-limit so the best completed checkpoint is saved cleanly.
-
-The convenience wrapper preprocesses, checks, and benchmarks:
+Run joint v1-v4 augmentation:
 
 ```bash
-bash scripts/hpc/run_imdb_nc.sh
+python -m experiments.node_classification.imdb_augmentation \
+  --config configs/imdb_nc_augmentation.yaml \
+  --variants v1 v2 v3 v4 \
+  --seeds 1566911444 20241017 20251017 \
+  --output-root results/imdb_nc_augmentation_v4_fixed \
+  --resume
 ```
 
-## Kendall tau
-
-After all matched seed artifacts exist, compare per-node class-score rankings:
+Run the invariant arm:
 
 ```bash
-python -m analysis.kendall_tau_imdb_nc \
-  --root results/imdb_nc \
-  --output reports/kendall_tau_imdb_nc_test.csv
+python -m experiments.node_classification.benchmark_imdb \
+  --config configs/imdb_nc_invariant.yaml \
+  --variants IMDb_invariant_v1 IMDb_invariant_v2 \
+             IMDb_invariant_v3 IMDb_invariant_v4 \
+  --seeds 1566911444 20241017 20251017 \
+  --output-root results/imdb_nc_invariant
 ```
 
-The analysis validates identical test node order and labels before computing
-node-level Kendall tau-b, then reports the mean and sample standard deviation
-over matched seeds.
+## DBLP link prediction
 
-## Repository layout
+> **WIP / optional:** This pipeline is retained for development. It is not
+> required and is not included in the current experiment set.
 
-```text
-preprocessing/                 raw IMDb -> shared and exact L=3 path tensors
-pain_nc/                       loader and PAIN node-classification model
-configs/imdb_nc.yaml           faithful default experiment configuration
-experiments/node_classification/
-                               training and multi-variant benchmark
-analysis/                      matched-seed Kendall tau analysis
-scripts/hpc/                   cluster-side pipeline wrapper
+DBLP uses deterministic sampled length-2/3 paths with a budget of 256 per root.
+Preprocess the physical variants and universal graph, then preprocess the
+invariant artifacts into a separate directory:
+
+```bash
+python -m preprocessing.dblp_link_prediction \
+  --mode baseline \
+  --output-dir data/preprocessed/DBLP \
+  --max-paths-per-root 256
+
+python -m preprocessing.dblp_link_prediction \
+  --mode invariant \
+  --output-dir data/preprocessed/DBLP_invariant \
+  --max-paths-per-root 256 \
+  --sampling-seed 1566911444
 ```
+
+Run the independent variants and universal graph:
+
+```bash
+python -m experiments.link_prediction.benchmark_dblp \
+  --config configs/dblp_lp.yaml \
+  --variants DBLP1 DBLP2 DBLP3 DBLP_universal \
+  --seeds 1566911444 20241017 20251017 \
+  --output-root results/dblp_lp
+```
+
+Run augmentation:
+
+```bash
+python -m experiments.link_prediction.dblp_augmentation \
+  --config configs/dblp_lp_augmentation.yaml \
+  --seeds 1566911444 20241017 20251017 \
+  --output-root results/dblp_lp_augmentation \
+  --resume
+```
+
+Run the invariant arm:
+
+```bash
+python -m experiments.link_prediction.benchmark_dblp \
+  --config configs/dblp_lp_invariant.yaml \
+  --variants DBLP_invariant_v1 DBLP_invariant_v2 DBLP_invariant_v3 \
+  --seeds 1566911444 20241017 20251017 \
+  --output-root results/dblp_lp_invariant
+```
+
+## Freebase node classification
+
+Freebase is much larger, so both ordinary and invariant preprocessing use
+bounded deterministic path sampling. Report these experiments as **sampled
+PAIN**. Preprocessing can be resumed after interruption.
+
+Preprocess the three physical variants and universal graph:
+
+```bash
+python -m preprocessing.freebase_node_classification \
+  --variants-root data/raw/freebase_node/dataset_variant_3hops_filter \
+  --output-dir data/preprocessed/Freebase \
+  --variants unchanged exact_2 exact_3 union_exact_2_3 \
+  --max-neighbors-per-relation 4 \
+  --path-fanout 8 \
+  --max-paths-per-root 256 \
+  --sampling-seed 1566911444 \
+  --split-seed 1566911444 \
+  --resume
+```
+
+Preprocess the invariant arm:
+
+```bash
+python -m preprocessing.freebase_invariant \
+  --variants-root data/raw/freebase_node/dataset_variant_3hops_filter \
+  --output-dir data/preprocessed/Freebase_invariant \
+  --variants unchanged exact_2 exact_3 \
+  --path-length 3 \
+  --max-neighbors-per-relation 4 \
+  --path-fanout 8 \
+  --max-paths-per-root 256 \
+  --sampling-seed 1566911444 \
+  --split-seed 1566911444 \
+  --resume
+```
+
+Run the three independent variants:
+
+```bash
+python -m experiments.node_classification.benchmark_freebase \
+  --config configs/freebase_nc.yaml \
+  --variants Freebase1 Freebase2 Freebase3 \
+  --seeds 1566911444 20241017 20251017 \
+  --output-root results/freebase_nc
+```
+
+Run the universal graph:
+
+```bash
+python -m experiments.node_classification.benchmark_freebase \
+  --config configs/freebase_nc.yaml \
+  --variants Freebase_universal \
+  --seeds 1566911444 20241017 20251017 \
+  --output-root results/freebase_nc_universal
+```
+
+Run the invariant arm:
+
+```bash
+python -m experiments.node_classification.freebase_invariant \
+  --config configs/freebase_nc_invariant.yaml \
+  --variants Freebase_invariant1 Freebase_invariant2 Freebase_invariant3 \
+  --seeds 1566911444 20241017 20251017 \
+  --output-root results/freebase_nc_invariant
+```
+
+## Hyperparameters
+
+The checked-in YAML files are the source of truth. The main settings are:
+
+| Experiment | Training budget | Early stopping | Learning rate | Path program |
+|---|---:|---:|---:|---|
+| IMDb independent, universal, invariant | 1,000 epochs | 80 epochs | 0.001 | exact length 0-3 |
+| IMDb augmentation | 250 super-epochs / 1,000 updates | 20 super-epochs | 0.001 | exact length 0-3 |
+| Freebase independent, universal, invariant | 300 epochs | 30 epochs | 0.001 | sampled length 0-3, cap 256/root |
+| DBLP independent, universal, invariant (WIP) | 1,000 epochs | 200 epochs | 0.005 | sampled length 0-3, cap 256/root |
+| DBLP augmentation (WIP) | 1,000 updates | 67 validation checks | 0.005 | sampled length 0-3, cap 256/root |
+
+All configurations use hidden size 128, five PAIN layers, a two-layer LSTM,
+shared LSTM weights, reversed paths, sum aggregation, and gradient clipping at
+5.0. IMDb streams chunks of 100,000 paths on the GPU. Freebase and DBLP stream
+chunks of 50,000 paths from host memory. Freebase additionally caps neighbors
+per semantic relation at 4 and uses path fanout 8.
+
+The wall-clock limits in the configs are 12 hours for IMDb, 48 hours for
+Freebase, and 22 hours for the optional DBLP pipeline. The three standard seeds
+must use identical preprocessing and hyperparameters.
+
+## Build the paper tables
+
+The builder reads individual per-seed artifacts rather than the aggregate CSV
+files written during training. This prevents a later partial run from silently
+replacing the complete aggregate. After copying the result directories into
+`results/`, run:
+
+```bash
+python build_paper_tables.py
+```
+
+It writes the following under `paper_tables/pain/`:
+
+- aggregate CSV tables;
+- Overleaf-ready LaTeX tables;
+- matched-seed Kendall-tau comparisons;
+- `PAIN_COMPLETENESS.md`, which lists every loaded, missing, or unreadable run.
+
+Missing seeds remain visibly marked as partial rather than being silently
+averaged as a complete result. The default input paths match the result roots
+shown in this README. Use `--output-dir <directory>` to change the destination
+or `--seeds <seed ...>` to select another seed set.
+
+The current builder covers IMDb node classification and the optional DBLP
+link-prediction artifacts. Freebase is not yet included in the table builder.
+
+## Notes
+
+- Do not mix GPU architectures across matched invariant runs.
+- Use the same preprocessing budgets and seeds for all compared arms.
+- `--overwrite` discards the normal completed-run skip behavior; use it only
+  when intentionally replacing an artifact.
+- The architecture and adaptation details are recorded in
+  [`docs/PAIN_FIDELITY.md`](docs/PAIN_FIDELITY.md).

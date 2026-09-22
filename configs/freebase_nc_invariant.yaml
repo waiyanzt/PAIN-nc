@@ -1,0 +1,42 @@
+# Invariant sampled PAIN node classification for Freebase1-3.  Architecture
+# and optimization match freebase_nc.yaml; only the conditional semantic-path
+# artifact directory differs.
+device: cuda:0
+
+data:
+  preprocessed_dir: data/preprocessed/Freebase_invariant
+  shared_path: data/preprocessed/Freebase_invariant/shared.pt
+  artifact_tag: L3_rel4_fan8_cap256
+
+model:
+  hidden_dim: 128
+  num_layers: 5
+  lstm_depth: 2
+  head_layers: 2
+  path_length: 3
+  dropout: 0.0
+  share_lstm: true
+  reverse_paths: true
+  mark_neighbors: true
+  shortest_path_encoding: false
+  path_aggregation: sum
+  jumping_knowledge: last
+  use_node_types: true
+  use_node_id_embeddings: true
+  node_embedding_init_std: 0.1
+  path_chunk_size: 50000
+  checkpoint_chunks: true
+  paths_on_device: false
+
+training:
+  selection_metric: macro_f1
+  epochs: 300
+  learning_rate: 0.001
+  weight_decay: 0.0
+  lr_factor: 0.5
+  lr_patience: 10
+  min_learning_rate: 0.00001
+  early_stopping_patience: 30
+  gradient_clip_norm: 5.0
+  max_hours: 48
+  deterministic: true

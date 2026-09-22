@@ -1,10 +1,11 @@
-# Faithful PAIN architecture from the official ZINC experiment, adapted only
-# at the output: graph pooling is replaced by node-wise classification.
+# Same PAIN architecture and training protocol as imdb_nc.yaml.  Only the
+# artifact directory changes: every source variant is independently compiled
+# to the same conditional semantic path program.
 device: cuda:0
 
 data:
-  preprocessed_dir: data/preprocessed/IMDB
-  shared_path: data/preprocessed/IMDB/shared.pt
+  preprocessed_dir: data/preprocessed/IMDB_invariant
+  shared_path: data/preprocessed/IMDB_invariant/shared.pt
 
 model:
   hidden_dim: 128
@@ -20,13 +21,8 @@ model:
   path_aggregation: sum
   jumping_knowledge: last
   use_node_types: true
-
-  # Chunking is exact: every path still contributes to the same sum.
   path_chunk_size: 100000
   checkpoint_chunks: true
-
-  # true is faster if the GPU can retain the complete path artifact.
-  # Set false to stream chunks from host memory.
   paths_on_device: true
 
 training:
@@ -41,4 +37,3 @@ training:
   gradient_clip_norm: 5.0
   max_hours: 12
   deterministic: true
-
