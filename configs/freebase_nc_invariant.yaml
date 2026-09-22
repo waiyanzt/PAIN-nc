@@ -1,12 +1,11 @@
-# Sampled PAIN node classification for the physical Freebase variants and union.
-# The model architecture stays aligned with the official PAIN ZINC configuration;
-# only learned node-id embeddings and bounded path preprocessing are added for the
-# featureless, large Freebase graph.
+# Invariant sampled PAIN node classification for Freebase1-3.  Architecture
+# and optimization match freebase_nc.yaml; only the conditional semantic-path
+# artifact directory differs.
 device: cuda:0
 
 data:
-  preprocessed_dir: data/preprocessed/Freebase
-  shared_path: data/preprocessed/Freebase/shared.pt
+  preprocessed_dir: data/preprocessed/Freebase_invariant
+  shared_path: data/preprocessed/Freebase_invariant/shared.pt
   artifact_tag: L3_rel4_fan8_cap256
 
 model:
@@ -25,9 +24,6 @@ model:
   use_node_types: true
   use_node_id_embeddings: true
   node_embedding_init_std: 0.1
-
-  # Stream compact path chunks from host memory. The H100 holds the active
-  # chunk and model state rather than every preprocessed path tensor at once.
   path_chunk_size: 50000
   checkpoint_chunks: true
   paths_on_device: false
