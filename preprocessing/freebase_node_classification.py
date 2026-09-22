@@ -28,7 +28,8 @@ import torch
 from sklearn.model_selection import train_test_split
 
 
-DEFAULT_VARIANTS = ("unchanged", "exact_2", "exact_3")
+VOCABULARY_VARIANTS = ("unchanged", "exact_2", "exact_3")
+DEFAULT_VARIANTS = (*VOCABULARY_VARIANTS, "union_exact_2_3")
 DISPLAY_NAMES = {
     "unchanged": "Freebase1",
     "exact_2": "Freebase2",
@@ -619,8 +620,13 @@ def preprocess(args: argparse.Namespace) -> None:
         shared = existing_shared
     else:
         atomic_torch_save(shared, shared_path)
+    # A fixed vocabulary is shared by originals and the materialized universal
+    # arm, even when this invocation preprocesses only one requested output.
+    schema_variants = tuple(
+        dict.fromkeys((*VOCABULARY_VARIANTS, *args.variants))
+    )
     edge_type_names, relation_mappings = relation_vocabulary(
-        variants_root, args.variants
+        variants_root, schema_variants
     )
     num_nodes = int(shared["x"].shape[0])
     reference_node_hash = shared_provenance["node_sha256"]
@@ -628,6 +634,11 @@ def preprocess(args: argparse.Namespace) -> None:
     summaries: dict[str, Any] = {}
     if metadata_path.exists() and args.resume:
         existing_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if existing_metadata.get("edge_type_names") != edge_type_names:
+            raise ValueError(
+                "Existing Freebase artifacts use a different relation vocabulary; "
+                "use the same complete variant set or a fresh output directory"
+            )
         summaries.update(existing_metadata.get("variants", {}))
     for variant in args.variants:
         started = time.perf_counter()
@@ -670,7 +681,7 @@ def preprocess(args: argparse.Namespace) -> None:
             continue
         if destination.exists() and not args.overwrite:
             raise FileExistsError(destination)
-        print(f"\n=== Freebase PAIN independent | {variant} ===", flush=True)
+        print(f"\n=== Freebase PAIN physical graph | {variant} ===", flush=True)
         adjacency, graph_stats = sampled_adjacency(
             source_dir / "link.dat",
             relation_to_types=relation_mappings[variant],
@@ -698,7 +709,11 @@ def preprocess(args: argparse.Namespace) -> None:
                 "variant": variant,
                 "display_name": DISPLAY_NAMES.get(variant, variant),
                 "num_nodes": num_nodes,
-                "mapping_mode": "independent_physical_variant",
+                "mapping_mode": (
+                    "universal_union_graph"
+                    if variant == "union_exact_2_3"
+                    else "independent_physical_variant"
+                ),
                 "path_length": args.path_length,
                 "path_semantics": "bounded_rooted_simple_paths_on_relation_stratified_sample",
                 "path_sampling": "canonical_top_k_per_source_relation_then_prefix_rotation",
@@ -736,10 +751,10 @@ def preprocess(args: argparse.Namespace) -> None:
         del adjacency, path_tensors, payload
 
     metadata = {
-        "format_version": "freebase_pain_independent_v1",
+        "format_version": "freebase_pain_physical_v2",
         "dataset": "Freebase",
         "task": "node_classification",
-        "mode": "independent_physical_variants",
+        "mode": "physical_variants_and_universal_union",
         "variants": summaries,
         "edge_type_names": edge_type_names,
         "path_length": args.path_length,
@@ -786,9 +801,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--path-fanout must be positive")
     if args.max_paths_per_root < 1:
         parser.error("--max-paths-per-root must be positive")
+    unknown = sorted(set(args.variants) - set(DEFAULT_VARIANTS))
+    if unknown:
+        parser.error("Unknown variants: " + ", ".join(unknown))
+    required = {args.reference_variant}
+    required.update(args.variants)
     missing = [
         args.variants_root / variant
-        for variant in [args.reference_variant, *args.variants]
+        for variant in sorted(required)
         if not (args.variants_root / variant).is_dir()
     ]
     if missing:

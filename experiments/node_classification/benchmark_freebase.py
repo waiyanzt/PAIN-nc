@@ -1,4 +1,4 @@
-"""Benchmark sampled PAIN-NC independently on physical Freebase variants."""
+"""Benchmark sampled PAIN-NC on physical or universal Freebase graphs."""
 from __future__ import annotations
 
 import argparse
@@ -20,6 +20,7 @@ VARIANTS = {
     "Freebase1": "unchanged",
     "Freebase2": "exact_2",
     "Freebase3": "exact_3",
+    "Freebase_universal": "union_exact_2_3",
 }
 METRICS = (
     "best_val_accuracy",
