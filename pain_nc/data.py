@@ -245,8 +245,24 @@ def load_imdb_graph(
         shared_meta=shared["meta"],
         variant_meta=variant["meta"],
     )
-    if shared["meta"].get("num_nodes") != variant["meta"].get("num_nodes"):
-        raise ValueError("Shared and variant artifacts have different node counts")
+    shared_num_nodes = int(shared["meta"].get("num_nodes", graph.num_nodes))
+    variant_num_nodes = variant["meta"].get("num_nodes")
+    if variant_num_nodes is None:
+        # Early Freebase artifacts omitted this metadata field. Every PAIN
+        # artifact contains a length-zero path rooted at each node, so the
+        # largest root id still provides an exact, backward-compatible count.
+        variant_num_nodes = (
+            int(variant["mask_index"].max().item()) + 1
+            if variant["mask_index"].numel()
+            else 0
+        )
+    else:
+        variant_num_nodes = int(variant_num_nodes)
+    if shared_num_nodes != variant_num_nodes:
+        raise ValueError(
+            "Shared and variant artifacts have different node counts: "
+            f"shared={shared_num_nodes}, variant={variant_num_nodes}"
+        )
     if validate:
         validate_graph(graph)
     return graph

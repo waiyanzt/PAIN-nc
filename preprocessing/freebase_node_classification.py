@@ -697,6 +697,7 @@ def preprocess(args: argparse.Namespace) -> None:
                 "dataset": "Freebase",
                 "variant": variant,
                 "display_name": DISPLAY_NAMES.get(variant, variant),
+                "num_nodes": num_nodes,
                 "mapping_mode": "independent_physical_variant",
                 "path_length": args.path_length,
                 "path_semantics": "bounded_rooted_simple_paths_on_relation_stratified_sample",
