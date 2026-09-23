@@ -7,7 +7,5 @@ runs/
 results/
 reports/
 checkpoints/
-data/raw/__MACOSX/
-data/raw/dataset_variant_3hops_filter/
-data/raw/
+data/
 tests/
