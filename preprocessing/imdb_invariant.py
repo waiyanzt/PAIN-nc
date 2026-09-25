@@ -25,6 +25,7 @@ from pain_nc.data import PATH_FIELDS
 from pain_nc.experiment import atomic_torch_save, atomic_write_json
 from preprocessing.imdb_node_classification import (
     EDGE_TYPE_NAMES,
+    IMDB_CONTRACT_VERSION,
     PATH_LENGTH,
     base_variant_edges,
     build_contract,
@@ -132,6 +133,7 @@ def preprocess(
 
     summary: dict = {
         "dataset": "IMDB",
+        "contract_version": IMDB_CONTRACT_VERSION,
         "mode": "invariant",
         "compiler": "imdb_movie_link_conditional_semantic_closure",
         "source_variants": list(INVARIANT_VARIANTS),
@@ -170,6 +172,7 @@ def preprocess(
         raw_edge_index, raw_edge_type = physical_tensors[variant]
         details = {
             "dataset": "IMDB",
+            "contract_version": IMDB_CONTRACT_VERSION,
             "variant": artifact_name,
             "source_variant": variant,
             "mapping_mode": "conditional_semantic_path_compile",

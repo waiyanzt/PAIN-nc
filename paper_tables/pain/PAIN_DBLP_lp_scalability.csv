@@ -1,9 +1,0 @@
-dataset,method,training_graph,n_seeds,expected_seeds,complete,training_time_sec_mean,training_time_sec_std,epochs_mean,epochs_std,parameter_mib_mean,parameter_mib_std,peak_training_gpu_mib_mean,peak_training_gpu_mib_std,peak_inference_gpu_mib_mean,peak_inference_gpu_mib_std
-DBLP,Independent,v1,0,3,False,,,,,,,,,,
-DBLP,Independent,v2,0,3,False,,,,,,,,,,
-DBLP,Independent,v3,0,3,False,,,,,,,,,,
-DBLP,Universal graph,universal,0,3,False,,,,,,,,,,
-DBLP,Augmentation,shared,0,3,False,,,,,,,,,,
-DBLP,Invariant,v1,0,3,False,,,,,,,,,,
-DBLP,Invariant,v2,0,3,False,,,,,,,,,,
-DBLP,Invariant,v3,0,3,False,,,,,,,,,,

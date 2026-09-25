@@ -14,6 +14,7 @@ import torch
 from pain_nc.config import load_config, merged_config
 from experiments.node_classification.train import save_artifact, train_one_run
 from pain_nc.telemetry import CUDA_MEMORY_KEYS, validate_resource_metrics
+from preprocessing.imdb_node_classification import IMDB_CONTRACT_VERSION
 
 
 DEFAULT_SEEDS = (1566911444, 20241017, 20251017)
@@ -82,6 +83,15 @@ def preflight(config: dict[str, Any], variants: list[str]) -> None:
             f"Run: python -m {preprocessor}"
         )
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if (
+        metadata.get("contract_version") != IMDB_CONTRACT_VERSION
+        or metadata.get("status") != "PASS"
+    ):
+        raise ValueError(
+            "IMDb artifacts are incomplete or use the old graph contract "
+            "without Movie--Year. Re-run the appropriate IMDb preprocessor "
+            "before training."
+        )
     if any(name in INVARIANT_VARIANTS for name in variants):
         physical = metadata.get("physical_graph_sha256", {})
         semantic = metadata.get("semantic_graph_sha256", {})
@@ -208,6 +218,11 @@ def main() -> None:
             if destination.exists() and not args.overwrite:
                 print(f"Loading existing {destination}")
                 artifact = torch.load(destination, map_location="cpu", weights_only=False)
+                if artifact.get("data_contract_version") != IMDB_CONTRACT_VERSION:
+                    raise RuntimeError(
+                        f"Existing artifact {destination} uses the old IMDb graph "
+                        "contract. Re-run with --overwrite or use a new output root."
+                    )
                 try:
                     validate_resource_metrics(artifact.get("resources", {}))
                 except ValueError as error:

@@ -1,8 +1,9 @@
-"""Joint IMDb graph-variant data augmentation for PAIN node classification."""
+"""Train one shared PAIN-NC model per seed across Freebase1-3."""
 from __future__ import annotations
 
 import argparse
 import copy
+import gc
 import json
 import time
 from pathlib import Path
@@ -11,7 +12,9 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 import torch
+from scipy.stats import kendalltau
 
+from experiments.node_classification.benchmark_freebase import DEFAULT_SEEDS
 from experiments.node_classification.train import build_model, resolve_device, set_seed
 from pain_nc.config import load_config, merged_config
 from pain_nc.data import PainGraph, load_imdb_graph
@@ -27,152 +30,163 @@ from pain_nc.experiment import (
     restore_rng_state,
 )
 from pain_nc.telemetry import (
+    PeakRSSMonitor,
     artifact_sizes,
     cuda_memory_stats,
     environment_metadata,
     merge_cuda_memory_stats,
     model_memory_bytes,
-    PeakRSSMonitor,
     reset_cuda_peak,
     validate_resource_metrics,
 )
-from preprocessing.imdb_node_classification import IMDB_CONTRACT_VERSION
 
 
-VARIANT_FILES = {
-    "v1": "v1_L3.pt",
-    "v2": "v2_L3.pt",
-    "v3": "v3_L3.pt",
-    "v4": "v4_L3.pt",
+VARIANTS = {
+    "Freebase1": "unchanged",
+    "Freebase2": "exact_2",
+    "Freebase3": "exact_3",
 }
-VARIANT_ALIASES = {
-    **{name: name for name in VARIANT_FILES},
-    **{f"imdb{index}": f"v{index}" for index in range(1, 5)},
-}
-SHARED_FIELDS = (
-    "x",
-    "y",
-    "node_type",
-    "train_mask",
-    "val_mask",
-    "test_mask",
-)
+SHARED_FIELDS = ("x", "y", "node_type", "train_mask", "val_mask", "test_mask")
 
 
 def parse_variants(values: list[str]) -> list[str]:
+    aliases = {name.lower(): name for name in VARIANTS}
     variants = []
     for value in values:
-        canonical = VARIANT_ALIASES.get(value.lower())
-        if canonical is None:
-            raise ValueError(f"Unknown IMDb variant {value!r}")
-        variants.append(canonical)
+        if value.lower() not in aliases:
+            raise ValueError(f"Unknown Freebase variant {value!r}")
+        variants.append(aliases[value.lower()])
     if len(variants) != len(set(variants)):
-        raise ValueError("Duplicate IMDb variants are not allowed")
+        raise ValueError("Duplicate Freebase variants are not allowed")
     if len(variants) < 2:
-        raise ValueError("Data augmentation requires at least two variants")
+        raise ValueError("Augmentation requires at least two variants")
     return variants
 
 
-def _torch_load(path: Path, map_location: Any = "cpu") -> Any:
-    try:
-        return torch.load(path, map_location=map_location, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=map_location)
+def artifact_paths(
+    config: Mapping[str, Any], variants: list[str]
+) -> dict[str, Path]:
+    directory = Path(config["data"]["preprocessed_dir"])
+    tag = str(config["data"].get("artifact_tag", "L3_rel4_fan8_cap256"))
+    paths = {"shared": Path(config["data"]["shared_path"])}
+    paths.update(
+        {
+            variant: directory / f"{VARIANTS[variant]}_{tag}.pt"
+            for variant in variants
+        }
+    )
+    missing = [path for path in paths.values() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing Freebase PAIN artifacts:\n"
+            + "\n".join(f"  - {path}" for path in missing)
+            + "\nRun: python -m preprocessing.freebase_node_classification"
+        )
+    return paths
+
+
+def _load(path: Path, *, mmap: bool = False, map_location: Any = "cpu") -> Any:
+    return torch.load(
+        path, map_location=map_location, mmap=mmap, weights_only=False
+    )
+
+
+def inspect_artifacts(
+    config: Mapping[str, Any], variants: list[str]
+) -> tuple[dict[str, Path], dict[str, dict[str, Any]]]:
+    """Check the shared contract and common relation vocabulary without path transforms."""
+    paths = artifact_paths(config, variants)
+    shared = _load(paths["shared"], mmap=True)
+    expected_length = int(config["model"]["path_length"])
+    reference_relations = None
+    reference_contract = None
+    details: dict[str, dict[str, Any]] = {}
+    for variant in variants:
+        payload = _load(paths[variant], mmap=True)
+        meta = payload["meta"]
+        relations = meta.get("edge_type_names")
+        contract = meta.get("shared_contract_sha256")
+        if not relations or not contract:
+            raise ValueError(f"{variant} is missing relation or shared-contract metadata")
+        if int(meta["path_length"]) != expected_length:
+            raise ValueError(f"{variant} path length differs from configuration")
+        if reference_relations is None:
+            reference_relations = relations
+            reference_contract = contract
+        elif relations != reference_relations or contract != reference_contract:
+            raise ValueError(f"{variant} has a different relation vocabulary or split contract")
+        if int(payload["mask_index"].max()) >= int(shared["x"].shape[0]):
+            raise ValueError(f"{variant} contains a root beyond the shared node range")
+        details[variant] = {
+            "num_paths": int(payload["path_lengths"].numel()),
+            "num_relations": len(relations),
+            "physical_graph_sha256": meta.get("physical_graph_sha256"),
+            "selected_path_program_sha256": meta.get(
+                "selected_path_program_sha256"
+            ),
+            "shared_contract_sha256": contract,
+        }
+        del payload
+    return paths, details
 
 
 def prepare_graphs(
     config: Mapping[str, Any], variants: list[str]
-) -> tuple[dict[str, PainGraph], dict[str, Path]]:
-    data_dir = Path(config["data"]["preprocessed_dir"])
-    shared_path = Path(config["data"]["shared_path"])
-    paths = {variant: data_dir / VARIANT_FILES[variant] for variant in variants}
-    missing = [path for path in (shared_path, *paths.values()) if not path.is_file()]
-    if missing:
-        raise FileNotFoundError(
-            "Missing PAIN IMDb artifacts:\n"
-            + "\n".join(f"  - {path}" for path in missing)
-            + "\nRun: python -m preprocessing.imdb_node_classification"
-        )
-
-    reverse_paths = bool(config["model"].get("reverse_paths", True))
-    shared_payload = _torch_load(shared_path)
-    if shared_payload.get("meta", {}).get("contract_version") != IMDB_CONTRACT_VERSION:
-        raise ValueError(
-            "IMDb artifacts use the old graph contract without Movie--Year. "
-            "Re-run python -m preprocessing.imdb_node_classification."
-        )
+) -> tuple[dict[str, PainGraph], dict[str, Path], dict[str, dict[str, Any]]]:
+    paths, details = inspect_artifacts(config, variants)
+    shared_payload = _load(paths["shared"], mmap=True)
     graphs = {
         variant: load_imdb_graph(
-            shared_path,
-            path,
-            reverse_paths=reverse_paths,
+            paths["shared"],
+            paths[variant],
+            reverse_paths=bool(config["model"].get("reverse_paths", True)),
             shared_payload=shared_payload,
         )
-        for variant, path in paths.items()
+        for variant in variants
     }
-    reference_name = variants[0]
-    reference = graphs[reference_name]
-    expected_path_length = int(config["model"]["path_length"])
-    for variant, graph in graphs.items():
-        if graph.variant_meta.get("contract_version") != IMDB_CONTRACT_VERSION:
-            raise ValueError(
-                f"{variant} uses an old artifact without Movie--Year; "
-                "re-run IMDb preprocessing."
-            )
-        if graph.num_nodes != reference.num_nodes:
-            raise ValueError(f"Node count differs for {variant}")
-        if graph.num_features != reference.num_features:
-            raise ValueError(f"Feature count differs for {variant}")
-        if graph.num_classes != reference.num_classes:
-            raise ValueError(f"Class count differs for {variant}")
-        if graph.num_node_types != reference.num_node_types:
-            raise ValueError(f"Node-type vocabulary differs for {variant}")
-        if graph.num_edge_types != reference.num_edge_types:
-            raise ValueError(f"Edge-type vocabulary differs for {variant}")
-        if int(graph.variant_meta["path_length"]) != expected_path_length:
-            raise ValueError(
-                f"{variant} path length does not match the model configuration"
-            )
+    reference = graphs[variants[0]]
+    for variant in variants[1:]:
+        graph = graphs[variant]
+        if (
+            graph.num_nodes != reference.num_nodes
+            or graph.num_classes != reference.num_classes
+            or graph.num_node_types != reference.num_node_types
+            or graph.num_edge_types != reference.num_edge_types
+        ):
+            raise ValueError(f"{variant} has an incompatible model shape")
         for field in SHARED_FIELDS:
             if not torch.equal(getattr(reference, field), getattr(graph, field)):
-                raise ValueError(
-                    f"Shared field {field} differs between {reference_name} and {variant}"
-                )
-    return graphs, {"shared": shared_path, **paths}
+                raise ValueError(f"Shared field {field} differs for {variant}")
+    return graphs, paths, details
 
 
 def move_graphs(
     graphs: Mapping[str, PainGraph],
     variants: list[str],
     device: torch.device,
+    *,
     move_paths: bool,
 ) -> dict[str, PainGraph]:
     first = variants[0]
     moved = {first: graphs[first].to(device, move_paths=move_paths)}
     for variant in variants[1:]:
         moved[variant] = graphs[variant].to(
-            device,
-            move_paths=move_paths,
-            shared_from=moved[first],
+            device, move_paths=move_paths, shared_from=moved[first]
         )
     return moved
 
 
 @torch.no_grad()
 def evaluate(
-    model: torch.nn.Module,
-    graph: PainGraph,
-    mask_name: str,
+    model: torch.nn.Module, graph: PainGraph, split: str
 ) -> tuple[float, dict[str, float], torch.Tensor, torch.Tensor]:
     model.eval()
-    logits = model(graph)
-    mask = getattr(graph, f"{mask_name}_mask")
-    indices = mask.nonzero(as_tuple=False).view(-1)
-    selected = logits[indices]
+    indices = getattr(graph, f"{split}_mask").nonzero(as_tuple=False).view(-1)
+    logits = model(graph)[indices]
     labels = graph.y[indices]
-    loss = torch.nn.functional.cross_entropy(selected, labels)
-    metrics = classification_metrics(selected, labels)
-    return float(loss), metrics, selected.detach().cpu(), indices.detach().cpu()
+    loss = torch.nn.functional.cross_entropy(logits, labels)
+    metrics = classification_metrics(logits, labels)
+    return float(loss), metrics, logits.detach().cpu(), indices.detach().cpu()
 
 
 def _optimizer_to_device(
@@ -184,33 +198,86 @@ def _optimizer_to_device(
                 state[key] = value.to(device)
 
 
-def _canonical_config(config: Mapping[str, Any]) -> str:
-    return json.dumps(dict(config), sort_keys=True, separators=(",", ":"), default=str)
+def _canonical(value: Mapping[str, Any]) -> str:
+    return json.dumps(dict(value), sort_keys=True, separators=(",", ":"), default=str)
+
+
+def rowwise_tau(left: np.ndarray, right: np.ndarray) -> float:
+    """Mean test-node Kendall tau-b, matching the paper-table definition."""
+    if left.shape != right.shape:
+        raise ValueError("Variant class-score shapes differ")
+    values = []
+    for left_row, right_row in zip(left, right, strict=True):
+        if np.array_equal(left_row, right_row):
+            values.append(1.0)
+            continue
+        value = kendalltau(left_row, right_row, variant="b").statistic
+        if value is not None and np.isfinite(value):
+            values.append(float(value))
+    return float(np.mean(values)) if values else float("nan")
 
 
 def run_seed(
     config: dict[str, Any],
     variants: list[str],
+    graphs: Mapping[str, PainGraph],
+    input_paths: Mapping[str, Path],
+    fingerprints: Mapping[str, Mapping[str, Any]],
     seed: int,
     output_root: Path,
     *,
     resume: bool,
-    super_epochs_override: int | None,
-    patience_override: int | None,
-) -> dict[str, Any]:
-    rss_monitor = PeakRSSMonitor().start()
-    set_seed(seed, bool(config["training"].get("deterministic", True)))
-    device = resolve_device(str(config["device"]))
-    cpu_graphs, input_paths = prepare_graphs(config, variants)
-    graphs = move_graphs(
-        cpu_graphs,
-        variants,
-        device,
-        move_paths=bool(config["model"].get("paths_on_device", True)),
-    )
-    del cpu_graphs
-    model = build_model(graphs[variants[0]], config).to(device)
+    super_epochs_override: int | None = None,
+    patience_override: int | None = None,
+) -> dict[str, Any] | None:
+    """Return a completed summary, or None when the invocation time cap fires."""
+    seed_dir = output_root / f"seed_{seed}"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    best_path = seed_dir / "shared_checkpoint.pt"
+    state_path = seed_dir / "latest_training_state.pt"
+    summary_path = seed_dir / "summary.pt"
     training = config["training"]
+    super_epochs = int(
+        super_epochs_override
+        if super_epochs_override is not None
+        else training.get("super_epochs", training["epochs"] // len(variants))
+    )
+    patience = int(
+        patience_override
+        if patience_override is not None
+        else training.get("early_stopping_patience", super_epochs)
+    )
+    if super_epochs < 1 or patience < 1:
+        raise ValueError("super-epochs and patience must be positive")
+    run_config = {
+        "dataset": "Freebase",
+        "model": "PAIN-NC",
+        "protocol": "joint_variant_augmentation",
+        "seed": seed,
+        "variants": variants,
+        "model_config": copy.deepcopy(config["model"]),
+        "training_config": {
+            key: value for key, value in training.items() if key != "max_hours"
+        },
+        "super_epochs": super_epochs,
+        "patience": patience,
+        "fingerprints": dict(fingerprints),
+    }
+    if summary_path.exists():
+        summary = _load(summary_path)
+        if _canonical(summary["run_config"]) != _canonical(run_config):
+            raise ValueError(f"Completed seed {seed} used a different configuration")
+        print(f"Loading completed {summary_path}", flush=True)
+        return summary
+    if state_path.exists() and not resume:
+        raise RuntimeError(
+            f"{state_path} exists; pass --resume to continue the seed"
+        )
+
+    rss_monitor = PeakRSSMonitor().start()
+    set_seed(seed, bool(training.get("deterministic", True)))
+    device = resolve_device(str(config["device"]))
+    model = build_model(graphs[variants[0]], config).to(device)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=float(training["learning_rate"]),
@@ -220,64 +287,23 @@ def run_seed(
         optimizer,
         mode="min",
         factor=float(training.get("lr_factor", 0.5)),
-        patience=int(training.get("lr_patience", 20)),
+        patience=int(training.get("lr_patience", 3)),
         min_lr=float(training.get("min_learning_rate", 1e-5)),
     )
-    super_epochs = int(
-        super_epochs_override
-        if super_epochs_override is not None
-        else (
-            training["super_epochs"]
-            if "super_epochs" in training
-            else training["epochs"]
-        )
-    )
-    patience = int(
-        patience_override
-        if patience_override is not None
-        else training.get("early_stopping_patience", super_epochs)
-    )
-    if super_epochs < 1 or patience < 1:
-        raise ValueError("super-epochs and patience must be positive")
-    gradient_clip = float(training.get("gradient_clip_norm", 0.0))
-    max_hours = float(training.get("max_hours", 0.0))
-
-    seed_dir = output_root / f"seed_{seed}"
-    seed_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = seed_dir / "shared_checkpoint.pt"
-    state_path = seed_dir / "latest_training_state.pt"
-    history_path = seed_dir / "training_history.csv"
     rng = np.random.RandomState(seed)
-    run_config = {
-        "dataset": "IMDB",
-        "model": "PAIN-NC",
-        "protocol": "joint_variant_augmentation",
-        "seed": seed,
-        "variants": variants,
-        "data_contract_version": graphs[variants[0]].shared_meta.get(
-            "contract_version"
-        ),
-        "model_config": copy.deepcopy(config["model"]),
-        "training_config": copy.deepcopy(training),
-        "patience": patience,
-        "input_paths": {key: str(path.resolve()) for key, path in input_paths.items()},
-    }
-
     history: list[dict[str, Any]] = []
-    completed = optimizer_steps = variant_epochs = 0
+    completed = optimizer_steps = 0
     best_macro_f1 = -1.0
     best_val_loss = float("inf")
+    best_super_epoch = 0
+    time_to_best = 0.0
     no_improvement = 0
     prior_seconds = 0.0
     prior_peak_rss = 0
     prior_training_gpu: dict[str, int] = {}
     if state_path.exists():
-        if not resume:
-            raise RuntimeError(
-                f"{state_path} already exists; pass --resume or choose a new output root"
-            )
-        state = _torch_load(state_path, map_location=device)
-        if _canonical_config(state["run_config"]) != _canonical_config(run_config):
+        state = _load(state_path, map_location=device)
+        if _canonical(state["run_config"]) != _canonical(run_config):
             raise ValueError("Resume configuration differs from the saved run")
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
@@ -287,22 +313,21 @@ def run_seed(
         history = list(state["history"])
         completed = int(state["completed_super_epoch"])
         optimizer_steps = int(state["optimizer_steps"])
-        variant_epochs = int(state["variant_epochs"])
         best_macro_f1 = float(state["best_macro_f1"])
         best_val_loss = float(state["best_val_loss"])
+        best_super_epoch = int(state["best_super_epoch"])
+        time_to_best = float(state["time_to_best_seconds"])
         no_improvement = int(state["no_improvement"])
         prior_seconds = float(state["training_seconds"])
         prior_peak_rss = int(state.get("process_peak_rss_bytes", 0))
         prior_training_gpu = dict(state.get("training_gpu", {}))
     elif resume:
-        print(f"[resume] No state at {state_path}; starting a new run.")
-    elif checkpoint_path.exists() or history_path.exists():
-        raise RuntimeError(
-            f"Incomplete prior outputs exist under {seed_dir}; choose a new output root"
-        )
+        print(f"[resume] No state for seed={seed}; starting from scratch", flush=True)
 
     reset_cuda_peak(device)
     started = time.monotonic()
+    max_hours = float(training.get("max_hours", 0.0))
+    gradient_clip = float(training.get("gradient_clip_norm", 0.0))
     for super_epoch in range(completed, super_epochs):
         if no_improvement >= patience:
             break
@@ -321,15 +346,14 @@ def run_seed(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
             optimizer.step()
             optimizer_steps += 1
-            variant_epochs += 1
             train_losses[variant] = float(loss.detach().cpu())
             del logits, loss
 
         validation_losses = {}
         validation_metrics = {}
         for variant in variants:
-            loss_value, metrics, _, _ = evaluate(model, graphs[variant], "val")
-            validation_losses[variant] = loss_value
+            val_loss, metrics, _, _ = evaluate(model, graphs[variant], "val")
+            validation_losses[variant] = val_loss
             validation_metrics[variant] = metrics
         mean_val_macro_f1 = float(
             np.mean([validation_metrics[name]["Macro_F1"] for name in variants])
@@ -337,6 +361,7 @@ def run_seed(
         mean_val_loss = float(np.mean(list(validation_losses.values())))
         scheduler.step(mean_val_loss)
         completed = super_epoch + 1
+        elapsed = prior_seconds + time.monotonic() - started
         improved = mean_val_macro_f1 > best_macro_f1 + 1e-12 or (
             abs(mean_val_macro_f1 - best_macro_f1) <= 1e-12
             and mean_val_loss < best_val_loss
@@ -344,6 +369,8 @@ def run_seed(
         if improved:
             best_macro_f1 = mean_val_macro_f1
             best_val_loss = mean_val_loss
+            best_super_epoch = completed
+            time_to_best = elapsed
             no_improvement = 0
             atomic_torch_save(
                 {
@@ -356,16 +383,14 @@ def run_seed(
                         "selection_metric": "mean_validation_Macro_F1",
                     },
                 },
-                checkpoint_path,
+                best_path,
             )
         else:
             no_improvement += 1
-
         row: dict[str, Any] = {
             "super_epoch": completed,
             "variant_order": ",".join(order),
             "optimizer_steps_cumulative": optimizer_steps,
-            "variant_epochs_cumulative": variant_epochs,
             "mean_train_loss": float(np.mean(list(train_losses.values()))),
             "mean_val_loss": mean_val_loss,
             "mean_val_macro_f1": mean_val_macro_f1,
@@ -377,9 +402,7 @@ def run_seed(
             row[f"val_loss_{variant}"] = validation_losses[variant]
             row[f"val_macro_f1_{variant}"] = validation_metrics[variant]["Macro_F1"]
         history.append(row)
-        atomic_write_csv(pd.DataFrame(history), history_path)
-
-        segment_seconds = time.monotonic() - started
+        atomic_write_csv(pd.DataFrame(history), seed_dir / "training_history.csv")
         training_gpu = merge_cuda_memory_stats(
             prior_training_gpu, cuda_memory_stats(device)
         )
@@ -395,11 +418,12 @@ def run_seed(
                 "history": history,
                 "completed_super_epoch": completed,
                 "optimizer_steps": optimizer_steps,
-                "variant_epochs": variant_epochs,
                 "best_macro_f1": best_macro_f1,
                 "best_val_loss": best_val_loss,
+                "best_super_epoch": best_super_epoch,
+                "time_to_best_seconds": time_to_best,
                 "no_improvement": no_improvement,
-                "training_seconds": prior_seconds + segment_seconds,
+                "training_seconds": prior_seconds + time.monotonic() - started,
                 "process_peak_rss_bytes": peak_rss,
                 "training_gpu": training_gpu,
             },
@@ -411,20 +435,29 @@ def run_seed(
             f"best={best_macro_f1:.6f} order={','.join(order)}",
             flush=True,
         )
-        if max_hours > 0 and prior_seconds + segment_seconds >= max_hours * 3600:
-            print(f"Stopping at configured max_hours={max_hours:g}", flush=True)
-            break
+        if (
+            max_hours > 0
+            and completed < super_epochs
+            and no_improvement < patience
+            and time.monotonic() - started >= max_hours * 3600
+        ):
+            rss_monitor.stop()
+            print(
+                f"Reached max_hours={max_hours:g} after a saved super-epoch; "
+                "rerun with --resume",
+                flush=True,
+            )
+            return None
 
-    training_seconds = prior_seconds + (time.monotonic() - started)
+    training_seconds = prior_seconds + time.monotonic() - started
     training_gpu = merge_cuda_memory_stats(
         prior_training_gpu, cuda_memory_stats(device)
     )
     peak_rss = max(prior_peak_rss, rss_monitor.peak_bytes)
-    if not checkpoint_path.is_file():
-        raise RuntimeError("No validation-selected checkpoint was saved")
-    checkpoint = _torch_load(checkpoint_path, map_location=device)
+    if optimizer_steps != completed * len(variants):
+        raise AssertionError("Optimizer-step accounting mismatch")
+    checkpoint = _load(best_path, map_location=device)
     model.load_state_dict(checkpoint["model"])
-
     reset_cuda_peak(device)
     per_variant_metrics = {}
     outputs = {}
@@ -433,9 +466,8 @@ def run_seed(
             model, graphs[variant], "test"
         )
         probabilities = logits.softmax(dim=-1).numpy()
-        predictions = probabilities.argmax(axis=1)
-        confidence = probabilities.max(axis=1)
         labels = graphs[variant].y[indices.to(device)].detach().cpu().numpy()
+        predictions = probabilities.argmax(axis=1)
         metrics["CrossEntropy"] = loss_value
         metrics["num_paths"] = float(graphs[variant].num_paths)
         per_variant_metrics[variant] = metrics
@@ -443,25 +475,33 @@ def run_seed(
             "item_id": indices.numpy(),
             "label": labels,
             "logits": logits.numpy(),
+            "probabilities": probabilities,
             "prediction": predictions,
-            "confidence": confidence,
+            "confidence": probabilities.max(axis=1),
         }
         frame = pd.DataFrame(
             {
                 "node_id": indices.numpy(),
                 "label": labels,
                 "prediction": predictions,
-                "confidence": confidence,
+                "confidence": probabilities.max(axis=1),
             }
         )
         for class_id in range(probabilities.shape[1]):
             frame[f"prob_class_{class_id}"] = probabilities[:, class_id]
             frame[f"logit_class_{class_id}"] = logits[:, class_id].numpy()
         atomic_write_csv(frame, seed_dir / f"test_scores_{variant}.csv")
-
     inference_gpu = cuda_memory_stats(device)
     peak_rss = max(peak_rss, rss_monitor.stop())
     pairwise = classification_invariance_rows(outputs)
+    for row in pairwise:
+        left = row["variant_a"]
+        right = row["variant_b"]
+        if not np.array_equal(outputs[left]["item_id"], outputs[right]["item_id"]):
+            raise ValueError("Test node order differs across variants")
+        row["kendall_tau_b"] = rowwise_tau(
+            outputs[left]["probabilities"], outputs[right]["probabilities"]
+        )
     atomic_write_csv(pd.DataFrame(pairwise), seed_dir / "pairwise_invariance.csv")
     atomic_write_csv(
         pd.DataFrame(
@@ -474,7 +514,7 @@ def run_seed(
     )
     resources = {
         **model_memory_bytes(model),
-        "checkpoint_bytes": int(checkpoint_path.stat().st_size),
+        "checkpoint_bytes": int(best_path.stat().st_size),
         "process_peak_rss_bytes": peak_rss,
         "training_gpu": training_gpu,
         "inference_gpu": inference_gpu,
@@ -482,33 +522,22 @@ def run_seed(
         "environment": environment_metadata(device),
     }
     validate_resource_metrics(resources)
-    expected_steps = completed * len(variants)
-    if optimizer_steps != expected_steps or variant_epochs != expected_steps:
-        raise AssertionError(
-            f"Optimizer-step accounting mismatch: {optimizer_steps} != {expected_steps}"
-        )
     summary = {
-        "dataset": "IMDB",
+        "dataset": "Freebase",
         "model": "PAIN-NC",
         "protocol": "joint_variant_augmentation",
         "seed": seed,
         "variants": variants,
         "selection_metric": "mean_validation_Macro_F1",
         "best_mean_val_macro_f1": best_macro_f1,
+        "best_super_epoch": best_super_epoch,
+        "time_to_best_seconds": time_to_best,
         "epoch_accounting": {
-            "definition": (
-                "one super-epoch performs one full-batch optimizer update "
-                "on every selected physical variant"
-            ),
+            "definition": "one optimizer update on every variant per super-epoch",
             "super_epochs_ran": completed,
-            "variant_epochs_ran": variant_epochs,
+            "variant_epochs_ran": optimizer_steps,
             "updates_per_super_epoch": len(variants),
             "optimizer_steps": optimizer_steps,
-            "compute_budget_warning": (
-                "At equal super-epochs this arm receives V times the optimizer "
-                "updates of one independent-variant run. Compare matched-update "
-                "results or disclose the asymmetry."
-            ),
         },
         "training_seconds": training_seconds,
         "mean_test_metrics": mean_dict(list(per_variant_metrics.values())),
@@ -518,7 +547,7 @@ def run_seed(
         "run_config": run_config,
     }
     atomic_write_json(summary, seed_dir / "summary.json")
-    atomic_torch_save(summary, seed_dir / "summary.pt")
+    atomic_torch_save(summary, summary_path)
     return summary
 
 
@@ -550,62 +579,80 @@ def summary_row(summary: Mapping[str, Any]) -> dict[str, Any]:
         prefix = phase.removesuffix("_gpu")
         for key, value in resources[phase].items():
             row[f"{prefix}_{key}"] = value
-    for key, value in resources["artifacts"].items():
-        row[key] = value
+    row.update(resources["artifacts"])
     return row
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/imdb_nc_augmentation.yaml")
-    parser.add_argument(
-        "--variants", nargs="+", default=["v1", "v2", "v3", "v4"]
-    )
-    parser.add_argument(
-        "--seeds", nargs="+", type=int,
-        default=[1566911444, 20241017, 20251017],
-    )
-    parser.add_argument("--device")
-    parser.add_argument("--super-epochs", type=int)
-    parser.add_argument("--patience", type=int)
-    parser.add_argument("--output-root", default="results/imdb_nc_augmentation")
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--preflight-only", action="store_true")
-    args = parser.parse_args()
-
-    config = load_config(args.config)
-    if args.device:
-        config = merged_config(config, {"device": args.device})
-    variants = parse_variants(args.variants)
-    if args.preflight_only:
-        graphs, paths = prepare_graphs(config, variants)
-        print(
-            f"[OK] IMDb PAIN augmentation: variants={','.join(variants)} "
-            f"nodes={graphs[variants[0]].num_nodes:,}"
-        )
-        for name, path in paths.items():
-            print(f"  {name}: {path} ({path.stat().st_size / 2**20:.1f} MiB)")
-        return
-
-    output_root = Path(args.output_root)
-    summaries = [
-        run_seed(
-            config,
-            variants,
-            seed,
-            output_root,
-            resume=args.resume,
-            super_epochs_override=args.super_epochs,
-            patience_override=args.patience,
-        )
-        for seed in args.seeds
-    ]
+def write_aggregates(summaries: list[dict[str, Any]], output_root: Path) -> None:
     atomic_write_csv(
         pd.DataFrame([summary_row(summary) for summary in summaries]),
         output_root / "seed_summary.csv",
     )
     atomic_write_json({"runs": summaries}, output_root / "all_seed_summaries.json")
-    print(f"[OK] Results written under {output_root}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--config", default="configs/freebase_nc_augmentation.yaml")
+    parser.add_argument(
+        "--variants", nargs="+", default=list(VARIANTS), choices=list(VARIANTS)
+    )
+    parser.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS))
+    parser.add_argument("--device")
+    parser.add_argument("--super-epochs", type=int)
+    parser.add_argument("--patience", type=int)
+    parser.add_argument("--output-root", type=Path, default=Path("results/freebase_nc_augmentation"))
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--preflight-only", action="store_true")
+    args = parser.parse_args()
+    variants = parse_variants(args.variants)
+    if len(args.seeds) != len(set(args.seeds)):
+        parser.error("Duplicate seeds are not allowed")
+    config = load_config(args.config)
+    if args.device:
+        config = merged_config(config, {"device": args.device})
+    paths, fingerprints = inspect_artifacts(config, variants)
+    if args.preflight_only:
+        print(f"[OK] Freebase PAIN augmentation: {','.join(variants)}")
+        for variant in variants:
+            print(
+                f"  {variant}: {fingerprints[variant]['num_paths']:,} sampled paths; "
+                f"{paths[variant].stat().st_size / 2**30:.2f} GiB artifact"
+            )
+        return
+    device = resolve_device(str(config["device"]))
+    cpu_graphs, paths, fingerprints = prepare_graphs(config, variants)
+    graphs = move_graphs(
+        cpu_graphs,
+        variants,
+        device,
+        move_paths=bool(config["model"].get("paths_on_device", False)),
+    )
+    del cpu_graphs
+    gc.collect()
+    summaries = []
+    for seed in args.seeds:
+        summary = run_seed(
+            config,
+            variants,
+            graphs,
+            paths,
+            fingerprints,
+            seed,
+            args.output_root,
+            resume=args.resume,
+            super_epochs_override=args.super_epochs,
+            patience_override=args.patience,
+        )
+        if summary is None:
+            print("Training paused. Re-run the same command with --resume.")
+            return
+        summaries.append(summary)
+        write_aggregates(summaries, args.output_root)
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    print(f"[OK] Freebase augmentation results written under {args.output_root}")
 
 
 if __name__ == "__main__":

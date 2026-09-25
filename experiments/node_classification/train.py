@@ -142,6 +142,13 @@ def train_one_run(
         variant_path,
         reverse_paths=bool(model_config.get("reverse_paths", True)),
     )
+    shared_contract = graph.shared_meta.get("contract_version")
+    variant_contract = graph.variant_meta.get("contract_version")
+    if shared_contract and variant_contract != shared_contract:
+        raise ValueError(
+            "Shared and variant artifacts use different data contracts: "
+            f"shared={shared_contract!r}, variant={variant_contract!r}"
+        )
     if int(graph.variant_meta["path_length"]) != int(model_config["path_length"]):
         raise ValueError(
             f"Artifact L={graph.variant_meta['path_length']} does not match "
@@ -270,6 +277,7 @@ def train_one_run(
         "model": "PAIN-NC",
         "variant": variant,
         "variant_source_name": graph.variant_meta.get("variant"),
+        "data_contract_version": graph.shared_meta.get("contract_version"),
         "seed": seed,
         "best_epoch": best_epoch,
         "epochs_trained": len(history),

@@ -62,8 +62,17 @@ def _windows_memory_counters():
 
     counters = ProcessMemoryCounters()
     counters.cb = ctypes.sizeof(counters)
-    handle = ctypes.windll.kernel32.GetCurrentProcess()
-    ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+    get_current_process = ctypes.windll.kernel32.GetCurrentProcess
+    get_current_process.restype = wintypes.HANDLE
+    handle = get_current_process()
+    get_process_memory_info = ctypes.windll.psapi.GetProcessMemoryInfo
+    get_process_memory_info.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(ProcessMemoryCounters),
+        wintypes.DWORD,
+    )
+    get_process_memory_info.restype = wintypes.BOOL
+    ok = get_process_memory_info(
         handle, ctypes.byref(counters), counters.cb
     )
     if not ok:

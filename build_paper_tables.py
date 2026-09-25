@@ -31,6 +31,7 @@ from scipy.stats import kendalltau
 REPO = Path(__file__).resolve().parent
 DEFAULT_SEEDS = (1566911444, 20241017, 20251017)
 MIB = 1024.0**2
+IMDB_CONTRACT_VERSION = "imdb_nc_movie_year_v2"
 
 IMDB_VARIANTS = ("v1", "v2", "v3", "v4")
 DBLP_VARIANTS = ("v1", "v2", "v3")
@@ -101,11 +102,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS))
     parser.add_argument("--output-dir", type=Path, default=Path("paper_tables/pain"))
-    parser.add_argument("--imdb-original-root", type=Path, default=Path("results/imdb_nc"))
-    parser.add_argument("--imdb-v4-root", type=Path, default=Path("results/imdb_nc_v4_fixed"))
-    parser.add_argument("--imdb-universal-root", type=Path, default=Path("results/imdb_nc_universal"))
-    parser.add_argument("--imdb-augmentation-root", type=Path, default=Path("results/imdb_nc_augmentation_v4_fixed"))
-    parser.add_argument("--imdb-invariant-root", type=Path, default=Path("results/imdb_nc_invariant"))
+    parser.add_argument("--imdb-original-root", type=Path, default=Path("results/imdb_nc_movie_year"))
+    parser.add_argument("--imdb-v4-root", type=Path, default=Path("results/imdb_nc_movie_year"))
+    parser.add_argument("--imdb-universal-root", type=Path, default=Path("results/imdb_nc_universal_movie_year"))
+    parser.add_argument("--imdb-augmentation-root", type=Path, default=Path("results/imdb_nc_augmentation_movie_year"))
+    parser.add_argument("--imdb-invariant-root", type=Path, default=Path("results/imdb_nc_invariant_movie_year"))
     parser.add_argument("--dblp-original-root", type=Path, default=Path("results/dblp_lp"))
     parser.add_argument("--dblp-augmentation-root", type=Path, default=Path("results/dblp_lp_augmentation"))
     parser.add_argument("--dblp-invariant-root", type=Path, default=Path("results/dblp_lp_invariant"))
@@ -208,6 +209,13 @@ def regular_run(
     dataset: str, task: str, method: str, variant: str, seed: int, path: Path
 ) -> Run:
     record = load_pt(path)
+    if (
+        dataset == "IMDB"
+        and record.get("data_contract_version") != IMDB_CONTRACT_VERSION
+    ):
+        raise ValueError(
+            "IMDb result predates the Movie--Year node-classification contract"
+        )
     if task == "nc":
         scores = as_numpy(record["y_prob"])
         row_ids = as_numpy(record["test_node_ids"])
@@ -277,6 +285,15 @@ def augmentation_run(
     summary_path = seed_dir / "summary.json"
     with summary_path.open(encoding="utf-8") as handle:
         summary = json.load(handle)
+    if (
+        dataset == "IMDB"
+        and summary.get("run_config", {}).get("data_contract_version")
+        != IMDB_CONTRACT_VERSION
+    ):
+        raise ValueError(
+            "IMDb augmentation result predates the Movie--Year "
+            "node-classification contract"
+        )
     metrics = json_metric_dict(summary["per_variant_test_metrics"][variant], task)
     if task == "nc":
         result_path = seed_dir / f"test_scores_{variant}.csv"
@@ -749,10 +766,9 @@ def write_completeness(expected: list[ExpectedRun], out: Path, seeds: tuple[int,
             "",
             "## Source policy",
             "",
-            "- IMDb independent v1--v3: `results/imdb_nc/`.",
-            "- IMDb independent v4: `results/imdb_nc_v4_fixed/` (the earlier v4 is intentionally ignored).",
-            "- IMDb augmentation: `results/imdb_nc_augmentation_v4_fixed/` (the earlier augmentation root is intentionally ignored).",
-            "- IMDb universal and invariant: their dedicated result roots.",
+            "- IMDb independent v1--v4: `results/imdb_nc_movie_year/`.",
+            "- IMDb augmentation: `results/imdb_nc_augmentation_movie_year/`.",
+            "- IMDb universal and invariant: their Movie--Year result roots.",
             "- DBLP independent and universal: `results/dblp_lp/`; augmentation and invariant: their dedicated result roots.",
             "",
             "## LaTeX use",

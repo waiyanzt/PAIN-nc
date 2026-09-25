@@ -7,5 +7,11 @@ runs/
 results/
 reports/
 checkpoints/
+
+# Local papers, manuscript fragments, and generated paper-table artifacts.
+*.pdf
+*.tex
+/paper_tables/
+
 data/
 tests/

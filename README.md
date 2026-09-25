@@ -54,34 +54,32 @@ Freebase variants.
 
 ## IMDb node classification
 
+The current IMDb contract contains Movie, Director, Actor, Link, and Year
+nodes. Movie--Year is present in every physical variant; only the
+Director/Actor attachments move around the Movie--Link bridge.
+
 Preprocess the four physical variants and universal graph:
 
 ```bash
-python -m preprocessing.imdb_node_classification
+python -m preprocessing.imdb_node_classification --no-validate
 ```
 
 Build the four independently compiled invariant artifacts:
 
 ```bash
 python -m preprocessing.imdb_invariant \
-  --output-dir data/preprocessed/IMDB_invariant
+  --output-dir data/preprocessed/IMDB_invariant \
+  --no-validate
 ```
 
-Run the four independent variants. IMDb4 is kept in the corrected result root
-expected by `build_paper_tables.py`:
+Run the four independent variants:
 
 ```bash
 python -m experiments.node_classification.benchmark_imdb \
   --config configs/imdb_nc.yaml \
-  --variants IMDb1 IMDb2 IMDb3 \
+  --variants IMDb1 IMDb2 IMDb3 IMDb4 \
   --seeds 1566911444 20241017 20251017 \
-  --output-root results/imdb_nc
-
-python -m experiments.node_classification.benchmark_imdb \
-  --config configs/imdb_nc.yaml \
-  --variants IMDb4 \
-  --seeds 1566911444 20241017 20251017 \
-  --output-root results/imdb_nc_v4_fixed
+  --output-root results/imdb_nc_movie_year
 ```
 
 Run the universal graph:
@@ -91,7 +89,7 @@ python -m experiments.node_classification.benchmark_imdb \
   --config configs/imdb_nc.yaml \
   --variants IMDb_universal \
   --seeds 1566911444 20241017 20251017 \
-  --output-root results/imdb_nc_universal
+  --output-root results/imdb_nc_universal_movie_year
 ```
 
 Run joint v1-v4 augmentation:
@@ -101,8 +99,7 @@ python -m experiments.node_classification.imdb_augmentation \
   --config configs/imdb_nc_augmentation.yaml \
   --variants v1 v2 v3 v4 \
   --seeds 1566911444 20241017 20251017 \
-  --output-root results/imdb_nc_augmentation_v4_fixed \
-  --resume
+  --output-root results/imdb_nc_augmentation_movie_year
 ```
 
 Run the invariant arm:
@@ -113,7 +110,7 @@ python -m experiments.node_classification.benchmark_imdb \
   --variants IMDb_invariant_v1 IMDb_invariant_v2 \
              IMDb_invariant_v3 IMDb_invariant_v4 \
   --seeds 1566911444 20241017 20251017 \
-  --output-root results/imdb_nc_invariant
+  --output-root results/imdb_nc_invariant_movie_year
 ```
 
 ## DBLP link prediction
@@ -215,6 +212,23 @@ python -m experiments.node_classification.benchmark_freebase \
   --output-root results/freebase_nc
 ```
 
+Run joint Freebase augmentation with one shared model per seed. Each
+super-epoch makes one optimizer update on each of Freebase1, Freebase2, and
+Freebase3, then validates the shared model on all three. The default cap of
+100 super-epochs is 300 updates per seed. The runner saves its training state
+after every super-epoch, so repeat the same command with `--resume` after a
+time limit or interruption. It needs all three physical variant artifacts and
+`shared.pt` in `data/preprocessed/Freebase/`. Use `--preflight-only` to check
+those artifacts before starting a GPU job.
+
+```bash
+python -m experiments.node_classification.freebase_augmentation \
+  --config configs/freebase_nc_augmentation.yaml \
+  --seeds 1566911444 20241017 20251017 \
+  --output-root results/freebase_nc_augmentation \
+  --resume
+```
+
 Run the universal graph:
 
 ```bash
@@ -244,6 +258,7 @@ The checked-in YAML files are the source of truth. The main settings are:
 | IMDb independent, universal, invariant | 1,000 epochs | 80 epochs | 0.001 | exact length 0-3 |
 | IMDb augmentation | 250 super-epochs / 1,000 updates | 20 super-epochs | 0.001 | exact length 0-3 |
 | Freebase independent, universal, invariant | 300 epochs | 30 epochs | 0.001 | sampled length 0-3, cap 256/root |
+| Freebase augmentation | 100 super-epochs / 300 updates | 10 super-epochs | 0.001 | sampled length 0-3, cap 256/root |
 | DBLP independent, universal, invariant (WIP) | 1,000 epochs | 200 epochs | 0.005 | sampled length 0-3, cap 256/root |
 | DBLP augmentation (WIP) | 1,000 updates | 67 validation checks | 0.005 | sampled length 0-3, cap 256/root |
 

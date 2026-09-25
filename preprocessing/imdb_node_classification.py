@@ -2,8 +2,10 @@
 
 This adapts the IMDB data contract in ``dhn_nclp`` while replacing DHN's
 homomorphism mappings with the tensors consumed by the original PAIN model.
-Every graph variant uses the same nodes, features, labels, and splits. Only the
-topology (and therefore the rooted simple paths) changes.
+Every graph variant uses the same nodes, features, labels, and splits. The
+Movie--Year relation is fixed in every variant; only the Director/Actor
+attachments around the Movie--Link bridge change (and therefore the rooted
+simple paths change).
 
 Paths are exact, rooted at every node, and include every simple path with zero
 through three edges. No path sampling is performed.
@@ -29,15 +31,25 @@ from sklearn.model_selection import train_test_split
 
 SEED = 1566911444
 PATH_LENGTH = 3
+IMDB_CONTRACT_VERSION = "imdb_nc_movie_year_v2"
 LABEL_NAMES = ("Action", "Comedy", "Drama")
 ACTOR_COLUMNS = ("actor_1_name", "actor_2_name", "actor_3_name")
-NODE_TYPE_NAMES = ("movie", "director", "actor", "imdb_link")
+NODE_TYPE_NAMES = ("movie", "director", "actor", "imdb_link", "year")
+EXPECTED_NODE_COUNTS = {
+    "movie": 4_180,
+    "director": 2_081,
+    "actor": 5_257,
+    "imdb_link": 4_180,
+    "year": 91,
+}
+EXPECTED_MOVIE_YEAR_EDGES = 4_177
 EDGE_TYPE_NAMES = (
     "movie-director",
     "movie-actor",
     "movie-imdb_link",
     "imdb_link-director",
     "imdb_link-actor",
+    "movie-year",
 )
 VARIANTS = ("v1", "v2", "v3", "v4", "universal")
 
@@ -63,6 +75,7 @@ def load_movies(csv_path: Path) -> tuple[pd.DataFrame, np.ndarray]:
         "director_name",
         "genres",
         "plot_keywords",
+        "title_year",
         *ACTOR_COLUMNS,
     }
     missing = sorted(required - set(movies.columns))
@@ -115,6 +128,12 @@ def make_node_maps(
         "imdb_link": sorted(
             movies["movie_imdb_link"].dropna().astype(str).unique().tolist()
         ),
+        "year": sorted(
+            {
+                int(value)
+                for value in movies["title_year"].dropna().tolist()
+            }
+        ),
     }
 
     maps: dict[str, dict] = {}
@@ -148,6 +167,9 @@ def canonical_feature_edges(
         link = maps["imdb_link"][str(row["movie_imdb_link"])]
         edges.add(canonical_edge(movie, director))
         edges.add(canonical_edge(movie, link))
+        if pd.notna(row["title_year"]):
+            year = maps["year"][int(row["title_year"])]
+            edges.add(canonical_edge(movie, year))
         for column in ACTOR_COLUMNS:
             if pd.notna(row[column]) and str(row[column]):
                 actor = maps["actor"][str(row[column])]
@@ -247,12 +269,22 @@ def canonical_edge(source: int, target: int) -> tuple[int, int]:
 def base_variant_edges(
     movies: pd.DataFrame, maps: dict[str, dict]
 ) -> dict[str, set[tuple[int, int]]]:
-    """Reproduce the four dhn_nclp IMDB topology variants."""
+    """Build the four IMDb NC variants and their universal union.
+
+    Movie--Year is a fixed relation in every variant.  The switching contract
+    changes only whether Director and Actor attach to Movie or its one-to-one
+    Link node.
+    """
     variants = {name: set() for name in VARIANTS[:-1]}
     for movie_local, row in movies.iterrows():
         movie = maps["movie"][movie_local]
         director = maps["director"][str(row["director_name"])]
         link = maps["imdb_link"][str(row["movie_imdb_link"])]
+        year = (
+            maps["year"][int(row["title_year"])]
+            if pd.notna(row["title_year"])
+            else None
+        )
         actors = [
             maps["actor"][str(row[column])]
             for column in ACTOR_COLUMNS
@@ -284,6 +316,12 @@ def base_variant_edges(
             canonical_edge(movie, actor) for actor in actors
         )
 
+        # Release year is shared, unchanged context for node classification.
+        if year is not None:
+            movie_year = canonical_edge(movie, year)
+            for edges in variants.values():
+                edges.add(movie_year)
+
     variants["universal"] = set().union(*variants.values())
     return variants
 
@@ -306,10 +344,10 @@ def compile_invariant_edges(
     invariant preprocessor before any experiment is allowed to run.
     """
     expected_families = {
-        "v1": {"movie-link", "movie-director", "movie-actor"},
-        "v2": {"movie-link", "link-director", "link-actor"},
-        "v3": {"movie-link", "movie-director", "link-actor"},
-        "v4": {"movie-link", "link-director", "movie-actor"},
+        "v1": {"movie-link", "movie-director", "movie-actor", "movie-year"},
+        "v2": {"movie-link", "link-director", "link-actor", "movie-year"},
+        "v3": {"movie-link", "movie-director", "link-actor", "movie-year"},
+        "v4": {"movie-link", "link-director", "movie-actor", "movie-year"},
     }
     if variant not in expected_families:
         raise ValueError(
@@ -324,6 +362,7 @@ def compile_invariant_edges(
             "movie-actor",
             "link-director",
             "link-actor",
+            "movie-year",
         )
     }
     type_pair_to_family = {
@@ -332,6 +371,7 @@ def compile_invariant_edges(
         (0, 3): ("movie-link", 0),
         (1, 3): ("link-director", 3),
         (2, 3): ("link-actor", 3),
+        (0, 4): ("movie-year", 0),
     }
     for left, right in sorted(physical_edges):
         left_type = int(node_types[left])
@@ -400,7 +440,12 @@ def compile_invariant_edges(
     director_source = movie_directors if variant in {"v1", "v3"} else link_directors
     actor_source = movie_actors if variant in {"v1", "v4"} else link_actors
 
-    semantic: set[tuple[int, int]] = set()
+    # Movie--Year is invariant physical context, so retain it directly.  The
+    # conditional closure below only canonicalizes the switched D/A relations.
+    semantic: set[tuple[int, int]] = {
+        canonical_edge(movie, year)
+        for movie, year in families["movie-year"]
+    }
     direct_edges = 0
     virtual_edges = 0
     director_contexts = 0
@@ -446,12 +491,14 @@ def compile_invariant_edges(
                 else:
                     virtual_edges += 1
 
-    # Every M-L edge is a direct semantic edge. Counts above cover D/A edges.
+    # Every M-L and M-Y edge is direct. Counts above cover D/A edges.
     direct_edges += len(families["movie-link"])
+    direct_edges += len(families["movie-year"])
     audit: dict[str, int | str] = {
         "variant": variant,
         "compiler": "imdb_movie_link_conditional_semantic_closure",
         "movie_link_contexts": len(families["movie-link"]),
+        "movie_year_contexts": len(families["movie-year"]),
         "director_contexts": director_contexts,
         "actor_contexts": actor_contexts,
         "direct_semantic_edges": direct_edges,
@@ -471,6 +518,7 @@ def edge_type_id(
         (0, 3): 2,
         (1, 3): 3,
         (2, 3): 4,
+        (0, 4): 5,
     }
     if pair not in mapping:
         raise ValueError(f"Unexpected IMDB endpoint-type pair: {pair}")
@@ -628,6 +676,17 @@ def validate_contract(contract: Contract) -> None:
         raise ValueError("Every movie must have exactly one target label")
     if sorted(np.unique(contract.labels).tolist()) != [0, 1, 2]:
         raise ValueError("Expected all three contiguous IMDB classes")
+    if contract.counts != EXPECTED_NODE_COUNTS:
+        raise ValueError(
+            "IMDb node counts do not match the Movie--Year experiment spec: "
+            f"expected={EXPECTED_NODE_COUNTS}, actual={contract.counts}"
+        )
+    movie_year_edges = int(contract.movies["title_year"].notna().sum())
+    if movie_year_edges != EXPECTED_MOVIE_YEAR_EDGES:
+        raise ValueError(
+            "IMDb Movie--Year edge count does not match the experiment spec: "
+            f"expected={EXPECTED_MOVIE_YEAR_EDGES}, actual={movie_year_edges}"
+        )
 
     split_sets = {
         name: set(values.tolist())
@@ -690,6 +749,7 @@ def save_shared(contract: Contract, output_dir: Path, csv_path: Path) -> None:
         ),
         "meta": {
             "dataset": "IMDB",
+            "contract_version": IMDB_CONTRACT_VERSION,
             "source": str(csv_path),
             "task": "movie_genre_node_classification",
             "label_names": list(LABEL_NAMES),
@@ -707,6 +767,8 @@ def save_shared(contract: Contract, output_dir: Path, csv_path: Path) -> None:
             "feature_protocol": (
                 "plot_keyword_bow_min_df_2_with_canonical_mean_propagation"
             ),
+            "fixed_relation_names": ["movie-imdb_link", "movie-year"],
+            "movies_without_year": int(contract.movies["title_year"].isna().sum()),
         },
     }
     torch.save(payload, output_dir / "shared.pt")
@@ -729,12 +791,18 @@ def preprocess(
     all_edges = base_variant_edges(contract.movies, contract.maps)
 
     summary = {
+        "dataset": "IMDB",
+        "contract_version": IMDB_CONTRACT_VERSION,
         "path_length": PATH_LENGTH,
         "path_semantics": "all rooted simple paths with 0..3 edges",
         "path_sampling": "none",
         "path_order": "root_first",
         "variants": {},
+        "status": "BUILDING",
     }
+    (output_dir / "metadata.json").write_text(
+        json.dumps(summary, indent=2) + "\n", encoding="utf-8"
+    )
     for variant in variants_to_build:
         print(f"\n=== IMDB PAIN-NC | {variant} | L={PATH_LENGTH} ===")
         edge_index, edge_type, adjacency, edge_lookup = graph_tensors(
@@ -750,6 +818,7 @@ def preprocess(
             **paths,
             "meta": {
                 "dataset": "IMDB",
+                "contract_version": IMDB_CONTRACT_VERSION,
                 "variant": variant,
                 "mapping_mode": (
                     "universal_union_graph"
@@ -780,6 +849,7 @@ def preprocess(
         print(f"saved {output_path}")
         del paths, payload
 
+    summary["status"] = "PASS"
     (output_dir / "metadata.json").write_text(
         json.dumps(summary, indent=2) + "\n", encoding="utf-8"
     )

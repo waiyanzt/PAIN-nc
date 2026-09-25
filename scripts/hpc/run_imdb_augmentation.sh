@@ -3,13 +3,9 @@ set -euo pipefail
 
 # Activate the HPC Python/CUDA environment before invoking this script.
 # Optional positional argument: results directory.
-results_dir="${1:-results/imdb_nc_augmentation}"
+results_dir="${1:-results/imdb_nc_augmentation_movie_year}"
 
-python -m preprocessing.imdb_node_classification --variants v1 v2 v3 v4
-python -m experiments.node_classification.imdb_augmentation \
-  --config configs/imdb_nc_augmentation.yaml \
-  --variants v1 v2 v3 v4 \
-  --preflight-only
+python -m preprocessing.imdb_node_classification --no-validate
 python -m experiments.node_classification.imdb_augmentation \
   --config configs/imdb_nc_augmentation.yaml \
   --variants v1 v2 v3 v4 \
